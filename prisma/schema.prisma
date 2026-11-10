@@ -1,0 +1,196 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum AccountStatus {
+  ACTIVE
+  SUSPENDED
+  DELETED
+}
+
+enum EventStatus {
+  DRAFT
+  PUBLISHED
+  UNPUBLISHED
+  CANCELLED
+  COMPLETED
+}
+
+enum AttendanceIntent {
+  ATTENDING
+  NOT_ATTENDING
+}
+
+enum RegistrationStatus {
+  PENDING
+  APPROVED
+  DECLINED
+  CANCELLED
+  NOT_REQUIRED
+}
+
+enum AttendeeType {
+  PRIMARY
+  ADDITIONAL
+}
+
+enum TicketStatus {
+  ISSUED
+  USED
+  VOID
+}
+
+model User {
+  id              String        @id @default(uuid())
+  firstName       String
+  lastName        String
+  email           String        @unique
+  passwordHash    String
+  emailVerifiedAt DateTime?
+  profileImageUrl String?
+  accountStatus   AccountStatus @default(ACTIVE)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  events       Event[]
+  auditLogs    AuditLog[]
+  checkInsMade AttendanceCheckIn[] @relation("CheckedInBy")
+}
+
+model Event {
+  id                   String      @id @default(uuid())
+  userId               String
+  title                String
+  slug                 String      @unique
+  eventCategory        String
+  description          String?
+  graduateName         String?
+  graduateImageUrl     String?
+  institution          String?
+  faculty              String?
+  department           String?
+  qualification        String?
+  eventDate            DateTime?
+  timezone             String?
+  venueName            String?
+  venueAddress         String?
+  venueInstructions    String?
+  personalMessage      String?
+  coverImageUrl        String?
+  rsvpDeadline         DateTime?
+  additionalGuestLimit Int?
+  approvalRequired     Boolean     @default(false)
+  eventStatus          EventStatus @default(DRAFT)
+  publishedAt          DateTime?
+  deletedAt            DateTime?
+  createdAt            DateTime    @default(now())
+  updatedAt            DateTime    @updatedAt
+
+  user          User               @relation(fields: [userId], references: [id], onDelete: Restrict)
+  registrations RSVPRegistration[]
+  photos        Photo[]
+  auditLogs     AuditLog[]
+
+  @@index([userId, deletedAt, eventStatus])
+}
+
+model RSVPRegistration {
+  id                     String             @id @default(uuid())
+  eventId                String
+  attendanceIntent       AttendanceIntent
+  status                 RegistrationStatus
+  relationshipToGraduate String?
+  confirmationTokenHash  String?            @unique @db.Char(64)
+  approvedAt             DateTime?
+  declinedAt             DateTime?
+  cancelledAt            DateTime?
+  createdAt              DateTime           @default(now())
+  updatedAt              DateTime           @updatedAt
+
+  event     Event      @relation(fields: [eventId], references: [id], onDelete: Restrict)
+  attendees Attendee[]
+
+  @@index([eventId, status])
+  @@index([eventId, attendanceIntent])
+}
+
+model Attendee {
+  id             String       @id @default(uuid())
+  registrationId String
+  firstName      String
+  lastName       String
+  email          String?
+  phone          String?
+  attendeeType   AttendeeType
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  registration RSVPRegistration @relation(fields: [registrationId], references: [id], onDelete: Restrict)
+  ticket       Ticket?
+
+  @@index([registrationId, attendeeType])
+}
+
+model Ticket {
+  id           String       @id @default(uuid())
+  attendeeId   String       @unique
+  qrTokenHash  String       @unique @db.Char(64)
+  ticketStatus TicketStatus @default(ISSUED)
+  issuedAt     DateTime     @default(now())
+  usedAt       DateTime?
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  attendee   Attendee           @relation(fields: [attendeeId], references: [id], onDelete: Restrict)
+  attendance AttendanceCheckIn?
+
+  @@index([ticketStatus])
+}
+
+model AttendanceCheckIn {
+  id                String   @id @default(uuid())
+  ticketId          String   @unique
+  checkedInByUserId String
+  checkedInAt       DateTime @default(now())
+  createdAt         DateTime @default(now())
+
+  ticket      Ticket @relation(fields: [ticketId], references: [id], onDelete: Restrict)
+  checkedInBy User   @relation("CheckedInBy", fields: [checkedInByUserId], references: [id], onDelete: Restrict)
+
+  @@index([checkedInAt])
+}
+
+model Photo {
+  id          String   @id @default(uuid())
+  eventId     String
+  title       String?
+  imageUrl    String
+  isPublished Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Restrict)
+
+  @@index([eventId, isPublished])
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  actorId   String?
+  eventId   String?
+  action    String
+  details   String?
+  createdAt DateTime @default(now())
+
+  user  User?  @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  event Event? @relation(fields: [eventId], references: [id], onDelete: SetNull)
+
+  @@index([eventId, createdAt])
+  @@index([actorId, createdAt])
+}
