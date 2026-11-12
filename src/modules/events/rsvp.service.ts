@@ -9,25 +9,21 @@ const guestNameSchema = z.string().trim().min(2).max(200).refine(
   'Enter the guest’s first and last name.',
 );
 
-const optionalPhoneSchema = z.preprocess(
-  (value) => value === '' ? undefined : value,
-  z.string()
-    .trim()
-    .min(7)
-    .max(40)
-    .regex(/^[+()\d.\-\s]+$/)
-    .refine((phone) => {
-      const digitCount = phone.match(/\d/g)?.length ?? 0;
-      return digitCount >= 7 && digitCount <= 15;
-    }, 'Enter a valid phone number.')
-    .optional(),
-);
+const primaryPhoneSchema = z.string()
+  .trim()
+  .min(7)
+  .max(40)
+  .regex(/^[+()\d.\-\s]+$/)
+  .refine((phone) => {
+    const digitCount = phone.match(/\d/g)?.length ?? 0;
+    return digitCount >= 7 && digitCount <= 15;
+  }, 'Enter a valid phone number.');
 
 const rsvpSchema = z.object({
   primaryGuestName: guestNameSchema,
   primaryGuestEmail: z.string().trim().email().max(254).transform((email) => email.toLowerCase()),
-  primaryGuestPhone: optionalPhoneSchema,
-  relationshipToGraduate: z.string().trim().min(1).max(100),
+  primaryGuestPhone: primaryPhoneSchema,
+  relationshipToGraduate: z.string().trim().min(1).max(100).optional(),
   attendanceIntent: z.nativeEnum(AttendanceIntent),
   additionalGuestNames: z.array(guestNameSchema).max(50).default([]),
 }).strict();
@@ -207,7 +203,7 @@ export async function submitRsvp(slug: string, input: unknown) {
           eventId: event.id,
           attendanceIntent: payload.attendanceIntent,
           status,
-          relationshipToGraduate: payload.relationshipToGraduate,
+          relationshipToGraduate: payload.relationshipToGraduate ?? null,
           confirmationTokenHash,
           attendees: {
             create: [

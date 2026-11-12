@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, type NextFunction, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { requireAuth } from '../../middleware/auth.js';
 import {
@@ -21,12 +21,46 @@ import {
 
 const eventRouter = Router();
 
+function createRateLimiter(maxRequests: number, windowMs: number) {
+  const requestsByIp = new Map<string, { count: number; resetAt: number }>();
+  const cleanup = setInterval(() => {
+    const now = Date.now();
+    for (const [ip, window] of requestsByIp) {
+      if (window.resetAt <= now) {
+        requestsByIp.delete(ip);
+      }
+    }
+  }, windowMs);
+  cleanup.unref();
+
+  return (req: Request, res: Response, next: NextFunction) => {
+    const key = req.ip ?? req.socket.remoteAddress ?? 'unknown';
+    const now = Date.now();
+    const current = requestsByIp.get(key);
+    const window = !current || current.resetAt <= now
+      ? { count: 0, resetAt: now + windowMs }
+      : current;
+
+    if (window.count >= maxRequests) {
+      res.setHeader('Retry-After', Math.max(1, Math.ceil((window.resetAt - now) / 1000)));
+      return res.status(429).json({ message: 'Too many requests. Please try again later.' });
+    }
+
+    window.count += 1;
+    requestsByIp.set(key, window);
+    return next();
+  };
+}
+
+const limitRsvpSubmission = createRateLimiter(5, 60 * 60 * 1000);
+const limitRsvpConfirmation = createRateLimiter(20, 15 * 60 * 1000);
+
 const paginationSchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(100).default(20),
 }).strict();
 
-eventRouter.get('/public/:slug', async (req, res, next) => {
+eventRouter.get('/public/:slug', async (req: Request<{ slug: string }>, res, next) => {
   try {
     const event = await getPublicEventBySlug(req.params.slug);
     res.status(200).json({ event });
@@ -35,7 +69,7 @@ eventRouter.get('/public/:slug', async (req, res, next) => {
   }
 });
 
-eventRouter.post('/public/:slug/rsvp', async (req, res, next) => {
+eventRouter.post('/public/:slug/rsvp', limitRsvpSubmission, async (req: Request<{ slug: string }>, res, next) => {
   try {
     const result = await submitRsvp(req.params.slug, req.body);
     res.status(201).json(result);
@@ -44,7 +78,7 @@ eventRouter.post('/public/:slug/rsvp', async (req, res, next) => {
   }
 });
 
-eventRouter.post('/public/:slug/rsvp/confirmation', async (req, res, next) => {
+eventRouter.post('/public/:slug/rsvp/confirmation', limitRsvpConfirmation, async (req: Request<{ slug: string }>, res, next) => {
   try {
     const confirmation = await getRsvpConfirmation(req.params.slug, req.body);
     res.status(200).json({ confirmation });
@@ -83,7 +117,7 @@ eventRouter.get('/:id', async (req, res, next) => {
   }
 });
 
-eventRouter.get('/:eventId/registrations', async (req, res, next) => {
+const listRsvps = async (req: Request<{ eventId: string }>, res: Response, next: NextFunction) => {
   try {
     const pagination = parseRegistrationPagination(req.query);
     const result = await listEventRegistrations(
@@ -96,9 +130,13 @@ eventRouter.get('/:eventId/registrations', async (req, res, next) => {
   } catch (error) {
     next(error);
   }
-});
+};
 
-eventRouter.get('/:eventId/registrations/:registrationId', async (req, res, next) => {
+const getRsvp = async (
+  req: Request<{ eventId: string; registrationId: string }>,
+  res: Response,
+  next: NextFunction,
+) => {
   try {
     const registration = await getEventRegistration(
       req.params.eventId,
@@ -109,7 +147,10 @@ eventRouter.get('/:eventId/registrations/:registrationId', async (req, res, next
   } catch (error) {
     next(error);
   }
-});
+};
+
+eventRouter.get('/:eventId/rsvps', listRsvps);
+eventRouter.get('/:eventId/rsvps/:registrationId', getRsvp);
 
 eventRouter.patch('/:id', async (req, res, next) => {
   try {
