@@ -2,6 +2,28 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+type CloudinaryConfiguration = {
+  cloudName: string;
+  apiKey: string;
+  apiSecret: string;
+};
+
+function readCloudinaryConfiguration(): CloudinaryConfiguration | undefined {
+  const cloudName = process.env.CLOUDINARY_CLOUD_NAME?.trim();
+  const apiKey = process.env.CLOUDINARY_API_KEY?.trim();
+  const apiSecret = process.env.CLOUDINARY_API_SECRET?.trim();
+
+  if (!cloudName || !apiKey || !apiSecret) {
+    return undefined;
+  }
+
+  if (/\s/.test(cloudName) || /\s/.test(apiKey) || /\s/.test(apiSecret)) {
+    return undefined;
+  }
+
+  return { cloudName, apiKey, apiSecret };
+}
+
 function validateConfiguration() {
   const jwtSecret = process.env.JWT_SECRET;
   if (!jwtSecret) {
@@ -56,7 +78,7 @@ function validateConfiguration() {
       }
     });
 
-  return { jwtSecret, databaseUrl, corsOrigins };
+  return { jwtSecret, databaseUrl, corsOrigins, cloudinary: readCloudinaryConfiguration() };
 }
 
 const validatedConfig = validateConfiguration();
@@ -66,4 +88,5 @@ export const env = {
   jwtSecret: validatedConfig.jwtSecret,
   databaseUrl: validatedConfig.databaseUrl,
   corsOrigins: validatedConfig.corsOrigins,
+  cloudinary: validatedConfig.cloudinary,
 };

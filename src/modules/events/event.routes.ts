@@ -1,6 +1,7 @@
 import { Router, type NextFunction, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { requireAuth } from '../../middleware/auth.js';
+import { createEventImageUploadSignature } from './image-upload.service.js';
 import {
   createEvent,
   getEventById,
@@ -62,6 +63,7 @@ const paginationSchema = z.object({
 }).strict();
 
 const decisionBodySchema = z.object({}).strict();
+const imageUploadSignatureBodySchema = z.object({}).strict();
 
 eventRouter.get('/public/:slug', async (req: Request<{ slug: string }>, res, next) => {
   try {
@@ -106,6 +108,16 @@ eventRouter.post('/', async (req, res, next) => {
   try {
     const event = await createEvent(req.user!.id, req.body);
     res.status(201).json({ event });
+  } catch (error) {
+    next(error);
+  }
+});
+
+eventRouter.post('/:eventId/image-upload-signature', async (req: Request<{ eventId: string }>, res, next) => {
+  try {
+    imageUploadSignatureBodySchema.parse(req.body ?? {});
+    const uploadSignature = await createEventImageUploadSignature(req.params.eventId, req.user!.id);
+    res.status(200).json({ upload: uploadSignature });
   } catch (error) {
     next(error);
   }

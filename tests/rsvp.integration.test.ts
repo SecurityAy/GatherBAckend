@@ -575,6 +575,160 @@ test('organiser RSVP decisions enforce ownership, pending state, and atomic tran
   }
 });
 
+test('event image upload signatures are owner-scoped and sign server-controlled image parameters', async () => {
+  const suffix = randomUUID();
+  const testUserIds: string[] = [];
+  const testEventIds: string[] = [];
+  const originalCloudinary = env.cloudinary;
+
+  try {
+    const owner = await prisma.user.create({
+      data: {
+        firstName: 'Image',
+        lastName: 'Owner',
+        email: `image-upload-${suffix}-owner@example.test`,
+        passwordHash: 'test-only-hash',
+      },
+    });
+    testUserIds.push(owner.id);
+    const otherOwner = await prisma.user.create({
+      data: {
+        firstName: 'Other',
+        lastName: 'Image Owner',
+        email: `image-upload-${suffix}-other@example.test`,
+        passwordHash: 'test-only-hash',
+      },
+    });
+    testUserIds.push(otherOwner.id);
+
+    const event = await prisma.event.create({
+      data: {
+        userId: owner.id,
+        title: 'Image Upload Integration Event',
+        slug: `image-upload-${suffix}`,
+        eventCategory: 'Test',
+      },
+    });
+    testEventIds.push(event.id);
+
+    env.cloudinary = {
+      cloudName: 'test-cloud',
+      apiKey: '123456789012345',
+      apiSecret: 'integration-test-cloudinary-secret',
+    };
+
+    server = app.listen(0);
+    await new Promise<void>((resolve, reject) => {
+      server!.once('listening', resolve);
+      server!.once('error', reject);
+    });
+
+    const path = `/api/events/${event.id}/image-upload-signature`;
+    const ownerHeaders = { Authorization: `Bearer ${accessToken(owner.id)}` };
+    const otherOwnerHeaders = { Authorization: `Bearer ${accessToken(otherOwner.id)}` };
+
+    const unauthenticated = await request(path, { method: 'POST' });
+    assert.equal(unauthenticated.status, 401);
+
+    const invalidEventId = await request('/api/events/not-a-uuid/image-upload-signature', {
+      method: 'POST',
+      headers: ownerHeaders,
+    });
+    assert.equal(invalidEventId.status, 400);
+
+    const missingEvent = await request(`/api/events/${randomUUID()}/image-upload-signature`, {
+      method: 'POST',
+      headers: ownerHeaders,
+    });
+    assert.equal(missingEvent.status, 404);
+
+    const nonOwner = await request(path, { method: 'POST', headers: otherOwnerHeaders });
+    assert.equal(nonOwner.status, 404);
+
+    const parameterOverride = await request(path, {
+      method: 'POST',
+      headers: { ...ownerHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ folder: 'untrusted/folder', public_id: 'chosen-id', allowed_formats: 'pdf' }),
+    });
+    assert.equal(parameterOverride.status, 400);
+
+    env.cloudinary = undefined;
+    const missingConfiguration = await request(path, { method: 'POST', headers: ownerHeaders });
+    assert.equal(missingConfiguration.status, 500);
+    assert.deepEqual(await missingConfiguration.json(), { message: 'Image uploads are not configured.' });
+
+    env.cloudinary = {
+      cloudName: 'test-cloud',
+      apiKey: '123456789012345',
+      apiSecret: 'integration-test-cloudinary-secret',
+    };
+    const success = await request(path, { method: 'POST', headers: ownerHeaders });
+    assert.equal(success.status, 200);
+    const responseText = await success.text();
+    assert.ok(!responseText.includes('integration-test-cloudinary-secret'));
+    assert.doesNotMatch(responseText, /api_secret|apiSecret/);
+    const response = JSON.parse(responseText) as {
+      upload: {
+        cloud_name: string;
+        api_key: string;
+        timestamp: number;
+        signature: string;
+        folder: string;
+        public_id: string;
+        resource_type: string;
+        allowed_formats: string;
+        overwrite: boolean;
+        client_max_file_size_bytes: number;
+        expires_at: number;
+      };
+    };
+    const upload = response.upload;
+    assert.equal(upload.cloud_name, 'test-cloud');
+    assert.equal(upload.api_key, '123456789012345');
+    assert.equal(upload.resource_type, 'image');
+    assert.equal(upload.folder, `gather/events/${event.id}`);
+    assert.match(upload.public_id, /^[0-9a-f-]{36}$/i);
+    assert.equal(upload.allowed_formats, 'jpg,jpeg,png,webp');
+    assert.equal(upload.overwrite, false);
+    assert.equal(upload.client_max_file_size_bytes, 5 * 1024 * 1024);
+    assert.ok(upload.timestamp <= Math.floor(Date.now() / 1000));
+    assert.ok(upload.expires_at > upload.timestamp);
+
+    const signedParameters = {
+      allowed_formats: upload.allowed_formats,
+      folder: upload.folder,
+      overwrite: upload.overwrite,
+      public_id: upload.public_id,
+      timestamp: upload.timestamp,
+    };
+    const serializedParameters = Object.entries(signedParameters)
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+      .map(([key, value]) => `${key}=${String(value)}`)
+      .join('&');
+    const expectedSignature = createHash('sha1')
+      .update(`${serializedParameters}integration-test-cloudinary-secret`, 'utf8')
+      .digest('hex');
+    assert.equal(upload.signature, expectedSignature);
+
+    const secondSuccess = await request(path, { method: 'POST', headers: ownerHeaders });
+    assert.equal(secondSuccess.status, 200);
+    const secondResponse = await secondSuccess.json() as { upload: { public_id: string } };
+    assert.notEqual(secondResponse.upload.public_id, upload.public_id);
+  } finally {
+    env.cloudinary = originalCloudinary;
+    if (server) {
+      await new Promise<void>((resolve, reject) => server!.close((error) => error ? reject(error) : resolve()));
+      server = undefined;
+    }
+    if (testEventIds.length) {
+      await prisma.event.deleteMany({ where: { id: { in: testEventIds } } });
+    }
+    if (testUserIds.length) {
+      await prisma.user.deleteMany({ where: { id: { in: testUserIds } } });
+    }
+  }
+});
+
 after(async () => {
   await prisma.$disconnect();
 });
