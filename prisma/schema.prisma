@@ -46,6 +46,20 @@ enum TicketStatus {
   VOID
 }
 
+enum NotificationType {
+  ORGANISER_NEW_RSVP
+  GUEST_RSVP_RECEIVED
+  GUEST_RSVP_APPROVED
+  GUEST_RSVP_DECLINED
+}
+
+enum NotificationStatus {
+  PENDING
+  PROCESSING
+  SENT
+  FAILED
+}
+
 model User {
   id              String        @id @default(uuid())
   firstName       String
@@ -115,9 +129,31 @@ model RSVPRegistration {
 
   event     Event      @relation(fields: [eventId], references: [id], onDelete: Restrict)
   attendees Attendee[]
+  notifications NotificationOutbox[]
 
   @@index([eventId, status])
   @@index([eventId, attendanceIntent])
+}
+
+model NotificationOutbox {
+  id             String             @id @default(uuid())
+  registrationId String
+  type           NotificationType
+  recipientEmail String
+  status         NotificationStatus @default(PENDING)
+  payload        Json
+  attemptCount   Int                @default(0)
+  nextRetryAt    DateTime           @default(now())
+  processingUntil DateTime?
+  lastError      String?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+  sentAt         DateTime?
+
+  registration RSVPRegistration @relation(fields: [registrationId], references: [id], onDelete: Cascade)
+
+  @@unique([registrationId, type])
+  @@index([status, nextRetryAt])
 }
 
 model Attendee {

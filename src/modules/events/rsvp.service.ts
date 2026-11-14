@@ -1,8 +1,10 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { AttendanceIntent, AttendeeType, EventStatus, Prisma, RegistrationStatus } from '@prisma/client';
+import { AttendanceIntent, AttendeeType, EventStatus, NotificationType, Prisma, RegistrationStatus } from '@prisma/client';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
 import { HttpError } from '../../middleware/errorHandler.js';
+import { env } from '../../config/env.js';
+import { enqueueNotification, notificationPayload } from '../notifications/notification-outbox.service.js';
 
 const guestNameSchema = z.string().trim().min(2).max(200).refine(
   (value) => value.split(/\s+/).length >= 2,
@@ -137,6 +139,9 @@ async function findAcceptingEvent(slug: string) {
       approvalRequired: true,
       additionalGuestLimit: true,
       rsvpDeadline: true,
+      user: { select: { email: true } },
+      eventDate: true,
+      venueName: true,
     },
   });
 
@@ -220,7 +225,7 @@ export async function submitRsvp(slug: string, input: unknown) {
         throw new HttpError(409, 'A recent RSVP for this email and event was already received.');
       }
 
-      return transaction.rSVPRegistration.create({
+      const createdRegistration = await transaction.rSVPRegistration.create({
         data: {
           eventId: event.id,
           attendanceIntent: payload.attendanceIntent,
@@ -240,6 +245,7 @@ export async function submitRsvp(slug: string, input: unknown) {
           },
         },
         select: {
+          id: true,
           attendanceIntent: true,
           status: true,
           createdAt: true,
@@ -249,6 +255,25 @@ export async function submitRsvp(slug: string, input: unknown) {
           },
         },
       });
+      const guestName = `${primaryName.firstName} ${primaryName.lastName}`.trim();
+      const basePayload = {
+        guestName,
+        guestEmail: payload.primaryGuestEmail,
+        eventName: event.title,
+        attendanceIntent: payload.attendanceIntent,
+        status: createdRegistration.status,
+        eventDate: event.eventDate?.toISOString() ?? null,
+        venue: event.venueName,
+        dashboardUrl: env.frontendUrl
+          ? `${env.frontendUrl.replace(/\/$/, '')}/dashboard/events/${encodeURIComponent(event.id)}/guests`
+          : undefined,
+        invitationUrl: env.frontendUrl && event.slug ? `${env.frontendUrl.replace(/\/$/, '')}/event/${encodeURIComponent(event.slug)}` : undefined,
+      } as const;
+      await enqueueNotification(transaction, createdRegistration.id, NotificationType.ORGANISER_NEW_RSVP, event.user.email,
+        notificationPayload({ type: 'ORGANISER_NEW_RSVP', recipientEmail: event.user.email, ...basePayload }));
+      await enqueueNotification(transaction, createdRegistration.id, NotificationType.GUEST_RSVP_RECEIVED, payload.primaryGuestEmail,
+        notificationPayload({ type: 'GUEST_RSVP_RECEIVED', recipientEmail: payload.primaryGuestEmail, ...basePayload }));
+      return createdRegistration;
     }, {
       isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
       maxWait: 10000,
@@ -348,14 +373,15 @@ export async function decideEventRegistration(
   ownerId: string,
   decision: 'approve' | 'reject',
 ) {
-  return prisma.$transaction(async (transaction) => {
+  try {
+    return await prisma.$transaction(async (transaction) => {
     const registration = await transaction.rSVPRegistration.findFirst({
       where: {
         id: registrationId,
         eventId,
         event: { is: { userId: ownerId, deletedAt: null } },
       },
-      select: { id: true, attendanceIntent: true, status: true },
+      select: { id: true, attendanceIntent: true, status: true, attendees: { where: { attendeeType: AttendeeType.PRIMARY }, select: { firstName: true, lastName: true, email: true } }, event: { select: { title: true, slug: true, eventDate: true, venueName: true } } },
     });
 
     if (!registration) {
@@ -401,8 +427,40 @@ export async function decideEventRegistration(
       throw new HttpError(404, 'Registration not found.');
     }
 
+    const primary = registration.attendees[0];
+    const notificationType = decision === 'approve' ? NotificationType.GUEST_RSVP_APPROVED : NotificationType.GUEST_RSVP_DECLINED;
+    if (primary?.email) {
+      await enqueueNotification(transaction, registration.id, notificationType, primary.email,
+        notificationPayload({
+          type: notificationType,
+          recipientEmail: primary.email,
+          guestName: `${primary.firstName} ${primary.lastName}`.trim(),
+          guestEmail: primary.email,
+          eventName: registration.event.title,
+          attendanceIntent: registration.attendanceIntent,
+          status: updatedRegistration.status,
+          eventDate: registration.event.eventDate?.toISOString() ?? null,
+          venue: registration.event.venueName,
+          invitationUrl: env.frontendUrl && registration.event.slug ? `${env.frontendUrl.replace(/\/$/, '')}/event/${encodeURIComponent(registration.event.slug)}` : undefined,
+        }));
+    }
+
     return updatedRegistration;
-  });
+    }, { maxWait: 10000, timeout: 30000 });
+  } catch (error) {
+    const diagnostic = error instanceof Prisma.PrismaClientKnownRequestError
+      ? { errorType: error.name, code: error.code }
+      : error instanceof Prisma.PrismaClientUnknownRequestError
+        ? { errorType: error.name, code: 'UNKNOWN_REQUEST' }
+        : error instanceof Prisma.PrismaClientRustPanicError
+          ? { errorType: error.name, code: 'ENGINE_PANIC' }
+          : { errorType: error instanceof Error ? error.name : 'UnknownError', code: 'UNCLASSIFIED' };
+    console.warn('RSVP decision transaction failed', diagnostic);
+    if (error instanceof Prisma.PrismaClientKnownRequestError && (error.code === 'P2034' || error.code === 'P2002')) {
+      throw new HttpError(409, `Only pending registrations can be ${decision === 'approve' ? 'approved' : 'rejected'}.`);
+    }
+    throw error;
+  }
 }
 
 export function parseRegistrationPagination(input: unknown) {

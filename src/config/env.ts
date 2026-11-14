@@ -24,6 +24,14 @@ function readCloudinaryConfiguration(): CloudinaryConfiguration | undefined {
   return { cloudName, apiKey, apiSecret };
 }
 
+export function readResendConfiguration(apiKey?: string, fromEmail?: string) {
+  const normalizedApiKey = apiKey?.trim();
+  if (!normalizedApiKey) return undefined;
+  const normalizedFrom = fromEmail?.trim() || 'onboarding@resend.dev';
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedFrom)) return undefined;
+  return { apiKey: normalizedApiKey, fromEmail: normalizedFrom };
+}
+
 function validateConfiguration() {
   const jwtSecret = process.env.JWT_SECRET;
   if (!jwtSecret) {
@@ -78,7 +86,12 @@ function validateConfiguration() {
       }
     });
 
-  return { jwtSecret, databaseUrl, corsOrigins, cloudinary: readCloudinaryConfiguration() };
+  const resend = readResendConfiguration(process.env.RESEND_API_KEY, process.env.RESEND_FROM_EMAIL);
+  return {
+    jwtSecret, databaseUrl, corsOrigins, cloudinary: readCloudinaryConfiguration(),
+    resend,
+    frontendUrl: process.env.FRONTEND_URL?.trim(),
+  };
 }
 
 const validatedConfig = validateConfiguration();
@@ -89,4 +102,6 @@ export const env = {
   databaseUrl: validatedConfig.databaseUrl,
   corsOrigins: validatedConfig.corsOrigins,
   cloudinary: validatedConfig.cloudinary,
+  resend: validatedConfig.resend,
+  frontendUrl: validatedConfig.frontendUrl,
 };

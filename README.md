@@ -87,5 +87,11 @@ Public rate limits are 5 RSVP submissions per IP per hour and 20 confirmation lo
 
 Run the RSVP integration test with `npm test`. It uses the configured PostgreSQL database to create uniquely named temporary records and removes them after the run.
 
+## Transactional email notifications
+
+RSVP creation and organiser decisions write idempotent notification jobs to the PostgreSQL outbox in the same transaction as the RSVP change. A background worker sends the four transactional notification types through Resend and retries transient failures up to five attempts. Without `RESEND_API_KEY`, jobs remain pending and RSVP operations continue normally. Configure `RESEND_API_KEY` and `RESEND_FROM_EMAIL` in the backend environment; the default sender is `onboarding@resend.dev`, which Resend restricts to verified test recipients. `FRONTEND_URL` is optional and is used only to form public invitation links. Additional guests are not emailed.
+
+For safe local integration tests, put the disposable Neon test database URLs in ignored `.env.test.local` and run `npm run test:safe`. The runner validates both URLs point to Neon database `gather_rsvp_test`, applies migrations to that database, then runs the suite. It requires no production `.env` database fallback.
+
 ## Notes
 Authentication and event management use Prisma/PostgreSQL. RSVP submissions and organiser registration reads are also implemented on the backend, but the frontend RSVP flow is not connected yet. Ticket and check-in routes are still prototype implementations and should not be used as authoritative production workflows.

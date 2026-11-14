@@ -1,13 +1,15 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { after, test } from 'node:test';
-import { AttendanceIntent, AttendeeType, EventStatus, RegistrationStatus } from '@prisma/client';
+import { AttendanceIntent, AttendeeType, EventStatus, NotificationStatus, NotificationType, RegistrationStatus } from '@prisma/client';
 import jwt from 'jsonwebtoken';
 import { ZodError } from 'zod';
-import { env } from '../src/config/env.js';
+import { env, readResendConfiguration } from '../src/config/env.js';
 import { prisma } from '../src/lib/prisma.js';
 import app from '../src/app.js';
-import { getRsvpConfirmation, submitRsvp } from '../src/modules/events/rsvp.service.js';
+import { decideEventRegistration, getRsvpConfirmation, submitRsvp } from '../src/modules/events/rsvp.service.js';
+import { notificationRetryDelay, runNotificationWorkerOnce, setNotificationSenderForTests } from '../src/modules/notifications/notification-outbox.service.js';
+import { renderNotificationEmail } from '../src/modules/notifications/email-templates.js';
 
 const suffix = randomUUID();
 const emailPrefix = `rsvp-integration-${suffix}`;
@@ -415,6 +417,23 @@ test('organiser RSVP decisions enforce ownership, pending state, and atomic tran
         where: { confirmationTokenHash: tokenHash },
         select: { id: true },
       });
+      const notices = await prisma.notificationOutbox.findMany({ where: { registrationId: registration.id } });
+      assert.equal(notices.length, 2);
+      assert.equal(notices.find((notice) => notice.type === NotificationType.ORGANISER_NEW_RSVP)?.recipientEmail, slug === otherEvent.slug ? otherOwner.email : owner.email);
+      const organiserNotice = notices.find((notice) => notice.type === NotificationType.ORGANISER_NEW_RSVP)!;
+      const organiserPayload = organiserNotice.payload as unknown as Parameters<typeof renderNotificationEmail>[0];
+      const expectedDashboardUrl = env.frontendUrl
+        ? `${env.frontendUrl.replace(/\/$/, '')}/dashboard/events/${encodeURIComponent(slug === otherEvent.slug ? otherEvent.id : event.id)}/guests`
+        : undefined;
+      assert.equal(organiserPayload.dashboardUrl, expectedDashboardUrl);
+      if (expectedDashboardUrl) {
+        const organiserEmail = renderNotificationEmail(organiserPayload);
+        assert.match(organiserEmail.html, new RegExp(expectedDashboardUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+        assert.match(organiserEmail.text, new RegExp(expectedDashboardUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+      }
+      assert.equal(notices.find((notice) => notice.type === NotificationType.GUEST_RSVP_RECEIVED)?.recipientEmail, `rsvp-decision-${suffix}-${emailSuffix}@example.test`);
+      assert.equal(notices.find((notice) => notice.type === NotificationType.GUEST_RSVP_RECEIVED)?.status, NotificationStatus.PENDING);
+      assert.equal((notices.find((notice) => notice.type === NotificationType.GUEST_RSVP_RECEIVED)?.payload as { status: string }).status, 'PENDING');
       return { id: registration.id, tokenHash };
     }
 
@@ -431,6 +450,8 @@ test('organiser RSVP decisions enforce ownership, pending state, and atomic tran
       where: { confirmationTokenHash: notAttendingHash },
       select: { id: true },
     });
+    assert.equal(await prisma.notificationOutbox.count({ where: { registrationId: notAttendingRegistration.id } }), 2);
+    assert.equal(await prisma.attendee.count({ where: { registrationId: notAttendingRegistration.id, attendeeType: AttendeeType.ADDITIONAL, email: { not: null } } }), 0);
 
     const cancelled = await prisma.rSVPRegistration.create({
       data: { eventId: event.id, attendanceIntent: AttendanceIntent.ATTENDING, status: RegistrationStatus.CANCELLED, cancelledAt: new Date() },
@@ -477,6 +498,11 @@ test('organiser RSVP decisions enforce ownership, pending state, and atomic tran
     const approvedJson = JSON.stringify(approvedBody);
     assert.ok(!approvedJson.includes(approval.tokenHash));
     assert.doesNotMatch(approvedJson, /confirmationToken|passwordHash/);
+    const approvalNotice = await prisma.notificationOutbox.findUnique({
+      where: { registrationId_type: { registrationId: approval.id, type: 'GUEST_RSVP_APPROVED' } },
+    });
+    assert.equal(approvalNotice?.recipientEmail, `rsvp-decision-${suffix}-approve@example.test`);
+    assert.equal(approvalNotice?.status, 'PENDING');
 
     const ownerRejection = await request(`${basePath}/${rejection.id}/reject`, {
       method: 'POST',
@@ -490,6 +516,10 @@ test('organiser RSVP decisions enforce ownership, pending state, and atomic tran
     assert.equal(rejectedBody.registration.approvedAt, null);
     assert.ok(rejectedBody.registration.declinedAt);
     assert.equal(rejectedBody.registration.attendees.length, 1);
+    const declineNotice = await prisma.notificationOutbox.findUnique({
+      where: { registrationId_type: { registrationId: rejection.id, type: 'GUEST_RSVP_DECLINED' } },
+    });
+    assert.equal(declineNotice?.recipientEmail, `rsvp-decision-${suffix}-reject@example.test`);
 
     const foreignApproval = await request(`/api/events/${otherEvent.id}/rsvps/${foreign.id}/approve`, {
       method: 'POST',
@@ -555,6 +585,67 @@ test('organiser RSVP decisions enforce ownership, pending state, and atomic tran
       finalRaceState.status === RegistrationStatus.DECLINED,
     );
     assert.ok(!(finalRaceState.approvedAt && finalRaceState.declinedAt));
+    assert.equal(await prisma.notificationOutbox.count({ where: { registrationId: concurrent.id, type: { in: ['GUEST_RSVP_APPROVED', 'GUEST_RSVP_DECLINED'] } } }), 1);
+    assert.equal(await prisma.notificationOutbox.count({ where: { registrationId: approval.id, type: 'GUEST_RSVP_APPROVED' } }), 1);
+    await assert.rejects(prisma.notificationOutbox.create({ data: {
+      registrationId: approval.id,
+      type: NotificationType.GUEST_RSVP_APPROVED,
+      recipientEmail: `rsvp-decision-${suffix}-approve@example.test`,
+      payload: {},
+    } }), (error: unknown) => error instanceof Error && 'code' in error && error.code === 'P2002');
+
+    const retryNotice = approvalNotice!;
+    let retryCalls = 0;
+    setNotificationSenderForTests({ emails: { send: async () => {
+      retryCalls += 1;
+      return retryCalls === 1 ? { error: { name: 'rate_limit' } } : { data: { id: 'mock-send' }, error: null };
+    } } }, 'onboarding@resend.dev');
+    const retryStartedAt = Date.now();
+    await runNotificationWorkerOnce(retryNotice.id);
+    const retryState = await prisma.notificationOutbox.findUniqueOrThrow({ where: { id: retryNotice.id } });
+    assert.equal(retryState.status, NotificationStatus.PENDING);
+    assert.equal(retryState.attemptCount, 1);
+    assert.equal(retryState.lastError, 'Error');
+    assert.equal(notificationRetryDelay(1), 30_000);
+    assert.ok(retryState.nextRetryAt.getTime() - retryStartedAt >= 29_000);
+    await prisma.notificationOutbox.update({ where: { id: retryNotice.id }, data: { nextRetryAt: new Date(0) } });
+    await runNotificationWorkerOnce(retryNotice.id);
+    const sentState = await prisma.notificationOutbox.findUniqueOrThrow({ where: { id: retryNotice.id } });
+    assert.equal(sentState.status, NotificationStatus.SENT);
+    assert.equal(sentState.attemptCount, 2);
+    assert.equal(retryCalls, 2);
+    assert.ok(await prisma.rSVPRegistration.findUnique({ where: { id: approval.id } }), 'provider failure must not roll back the approved RSVP');
+
+    let concurrentSendCalls = 0;
+    setNotificationSenderForTests({ emails: { send: async () => {
+      concurrentSendCalls += 1;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      return { data: { id: 'mock-send' }, error: null };
+    } } }, 'onboarding@resend.dev');
+    const [workerOne, workerTwo] = await Promise.all([
+      runNotificationWorkerOnce(declineNotice!.id),
+      runNotificationWorkerOnce(declineNotice!.id),
+    ]);
+    assert.equal(Number(workerOne) + Number(workerTwo), 1);
+    assert.equal(concurrentSendCalls, 1);
+    assert.equal((await prisma.notificationOutbox.findUniqueOrThrow({ where: { id: declineNotice!.id } })).status, NotificationStatus.SENT);
+
+    const concurrentNotice = await prisma.notificationOutbox.findFirstOrThrow({
+      where: { registrationId: concurrent.id, type: { in: [NotificationType.GUEST_RSVP_APPROVED, NotificationType.GUEST_RSVP_DECLINED] } },
+    });
+    await prisma.notificationOutbox.update({ where: { id: concurrentNotice.id }, data: { attemptCount: 4, nextRetryAt: new Date(0) } });
+    setNotificationSenderForTests({ emails: { send: async () => ({ error: { name: 'invalid_recipient' } }) } }, 'onboarding@resend.dev');
+    await runNotificationWorkerOnce(concurrentNotice.id);
+    const permanentFailure = await prisma.notificationOutbox.findUniqueOrThrow({ where: { id: concurrentNotice.id } });
+    assert.equal(permanentFailure.status, NotificationStatus.FAILED);
+    assert.equal(permanentFailure.attemptCount, 5);
+    setNotificationSenderForTests(undefined);
+    const queuedWithoutProvider = await prisma.notificationOutbox.findFirst({ where: { registrationId: notAttendingRegistration.id, type: NotificationType.GUEST_RSVP_RECEIVED } });
+    assert.ok(queuedWithoutProvider);
+    await runNotificationWorkerOnce(queuedWithoutProvider.id);
+    const stillQueued = await prisma.notificationOutbox.findUniqueOrThrow({ where: { id: queuedWithoutProvider.id } });
+    assert.equal(stillQueued.status, NotificationStatus.PENDING);
+    assert.equal(stillQueued.attemptCount, 0);
   } finally {
     if (server) {
       await new Promise<void>((resolve, reject) => server!.close((error) => error ? reject(error) : resolve()));
@@ -726,6 +817,103 @@ test('event image upload signatures are owner-scoped and sign server-controlled 
     if (testUserIds.length) {
       await prisma.user.deleteMany({ where: { id: { in: testUserIds } } });
     }
+  }
+});
+
+test('Resend configuration gaps preserve RSVP flows and acknowledgements render status-specific content', async () => {
+  const suffix = randomUUID();
+  const originalResend = env.resend;
+  const originalFrontendUrl = env.frontendUrl;
+  let ownerId: string | undefined;
+  let eventId: string | undefined;
+  try {
+    const staleFixtures = await prisma.event.findMany({ where: { slug: { startsWith: 'email-status-' } }, select: { id: true } });
+    if (staleFixtures.length) {
+      const staleIds = staleFixtures.map(({ id }) => id);
+      await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: staleIds } } } });
+      await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: staleIds } } });
+      await prisma.event.deleteMany({ where: { id: { in: staleIds } } });
+      await prisma.user.deleteMany({ where: { email: { startsWith: 'mail-owner-' } } });
+    }
+    assert.equal(readResendConfiguration(undefined, 'onboarding@resend.dev'), undefined);
+    assert.deepEqual(readResendConfiguration('test-only-key', undefined), {
+      apiKey: 'test-only-key',
+      fromEmail: 'onboarding@resend.dev',
+    });
+
+    const owner = await prisma.user.create({ data: {
+      firstName: 'Mail', lastName: 'Owner', email: `mail-owner-${suffix}@example.test`, passwordHash: 'test-only-hash',
+    } });
+    ownerId = owner.id;
+    const event = await prisma.event.create({ data: {
+      userId: owner.id, title: 'Email Status Event', slug: `email-status-${suffix}`, eventCategory: 'Test',
+      eventStatus: EventStatus.PUBLISHED, approvalRequired: true,
+    } });
+    eventId = event.id;
+    env.resend = undefined;
+    env.frontendUrl = 'https://gather-test.example';
+
+    const pending = await submitRsvp(event.slug, rsvpBody(`guest-pending-${suffix}@example.test`));
+    assert.equal(pending.registration.status, RegistrationStatus.PENDING);
+    const pendingId = (await prisma.rSVPRegistration.findUniqueOrThrow({
+      where: { confirmationTokenHash: createHash('sha256').update(pending.confirmationToken).digest('hex') }, select: { id: true },
+    })).id;
+    const organiserNotice = await prisma.notificationOutbox.findUniqueOrThrow({
+      where: { registrationId_type: { registrationId: pendingId, type: NotificationType.ORGANISER_NEW_RSVP } },
+    });
+    const organiserPayload = organiserNotice.payload as unknown as Parameters<typeof renderNotificationEmail>[0];
+    const expectedDashboardUrl = `https://gather-test.example/dashboard/events/${event.id}/guests`;
+    assert.equal(organiserPayload.dashboardUrl, expectedDashboardUrl);
+    const organiserEmail = renderNotificationEmail(organiserPayload);
+    assert.ok(organiserEmail.html.includes(expectedDashboardUrl));
+    assert.ok(organiserEmail.text.includes(expectedDashboardUrl));
+    const pendingEmail = renderNotificationEmail({
+      type: 'GUEST_RSVP_RECEIVED', recipientEmail: `guest-pending-${suffix}@example.test`,
+      guestName: 'Guest Person', guestEmail: `guest-pending-${suffix}@example.test`, eventName: event.title,
+      attendanceIntent: 'ATTENDING', status: 'PENDING',
+    });
+    assert.equal(pendingEmail.subject, `We received your RSVP for ${event.title}`);
+    assert.match(pendingEmail.text, /received and is awaiting organiser approval/i);
+    assert.match(pendingEmail.html, /received and is awaiting organiser approval/i);
+
+    await decideEventRegistration(event.id, pendingId, owner.id, 'approve');
+    const approvedEmail = renderNotificationEmail({
+      type: 'GUEST_RSVP_RECEIVED', recipientEmail: `guest-pending-${suffix}@example.test`,
+      guestName: 'Guest Person', guestEmail: `guest-pending-${suffix}@example.test`, eventName: event.title,
+      attendanceIntent: 'ATTENDING', status: 'APPROVED',
+    });
+    assert.match(approvedEmail.text, /your RSVP is approved/i);
+    assert.match(approvedEmail.html, /your RSVP is approved/i);
+
+    env.resend = readResendConfiguration('test-only-key', undefined);
+    const notAttending = await submitRsvp(event.slug, rsvpBody(`guest-no-${suffix}@example.test`, { attendanceIntent: AttendanceIntent.NOT_ATTENDING }));
+    assert.equal(notAttending.registration.status, RegistrationStatus.NOT_REQUIRED);
+    const notRequiredEmail = renderNotificationEmail({
+      type: 'GUEST_RSVP_RECEIVED', recipientEmail: `guest-no-${suffix}@example.test`,
+      guestName: 'Guest Person', guestEmail: `guest-no-${suffix}@example.test`, eventName: event.title,
+      attendanceIntent: 'NOT_ATTENDING', status: 'NOT_REQUIRED',
+    });
+    assert.match(notRequiredEmail.text, /response was recorded as not attending; no approval is required/i);
+    assert.match(notRequiredEmail.html, /response was recorded as not attending; no approval is required/i);
+
+    const declined = await submitRsvp(event.slug, rsvpBody(`guest-decline-${suffix}@example.test`));
+    const declinedId = (await prisma.rSVPRegistration.findUniqueOrThrow({
+      where: { confirmationTokenHash: createHash('sha256').update(declined.confirmationToken).digest('hex') }, select: { id: true },
+    })).id;
+    const beforeDecline = await prisma.notificationOutbox.count({ where: { registrationId: declinedId, type: NotificationType.GUEST_RSVP_DECLINED } });
+    await decideEventRegistration(event.id, declinedId, owner.id, 'reject');
+    assert.equal(beforeDecline, 0);
+    assert.equal(await prisma.notificationOutbox.count({ where: { registrationId: declinedId, type: NotificationType.GUEST_RSVP_DECLINED } }), 1);
+    assert.equal((await prisma.notificationOutbox.findMany({ where: { registrationId: pendingId } })).length, 3);
+  } finally {
+    env.resend = originalResend;
+    env.frontendUrl = originalFrontendUrl;
+    if (eventId) {
+      await prisma.attendee.deleteMany({ where: { registration: { eventId } } });
+      await prisma.rSVPRegistration.deleteMany({ where: { eventId } });
+      await prisma.event.deleteMany({ where: { id: eventId } });
+    }
+    if (ownerId) await prisma.user.deleteMany({ where: { id: ownerId } });
   }
 });
 
