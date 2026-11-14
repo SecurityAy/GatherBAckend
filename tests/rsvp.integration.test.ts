@@ -360,6 +360,221 @@ test('public RSVP validation, persistence, confirmation, ownership, and throttli
   }
 });
 
+test('organiser RSVP decisions enforce ownership, pending state, and atomic transitions', async () => {
+  const suffix = randomUUID();
+  const testUserIds: string[] = [];
+  const testEventIds: string[] = [];
+
+  try {
+    const owner = await prisma.user.create({
+      data: {
+        firstName: 'Decision',
+        lastName: 'Owner',
+        email: `rsvp-decision-${suffix}-owner@example.test`,
+        passwordHash: 'test-only-hash',
+      },
+    });
+    testUserIds.push(owner.id);
+    const otherOwner = await prisma.user.create({
+      data: {
+        firstName: 'Other',
+        lastName: 'Decision Owner',
+        email: `rsvp-decision-${suffix}-other@example.test`,
+        passwordHash: 'test-only-hash',
+      },
+    });
+    testUserIds.push(otherOwner.id);
+
+    const event = await prisma.event.create({
+      data: {
+        userId: owner.id,
+        title: 'Decision Integration Event',
+        slug: `rsvp-decision-${suffix}`,
+        eventCategory: 'Test',
+        eventStatus: EventStatus.PUBLISHED,
+        approvalRequired: true,
+      },
+    });
+    testEventIds.push(event.id);
+    const otherEvent = await prisma.event.create({
+      data: {
+        userId: otherOwner.id,
+        title: 'Other Decision Integration Event',
+        slug: `rsvp-decision-other-${suffix}`,
+        eventCategory: 'Test',
+        eventStatus: EventStatus.PUBLISHED,
+        approvalRequired: true,
+      },
+    });
+    testEventIds.push(otherEvent.id);
+
+    async function createPendingRegistration(slug: string, emailSuffix: string) {
+      const submission = await submitRsvp(slug, rsvpBody(`rsvp-decision-${suffix}-${emailSuffix}@example.test`));
+      const tokenHash = createHash('sha256').update(submission.confirmationToken).digest('hex');
+      const registration = await prisma.rSVPRegistration.findUniqueOrThrow({
+        where: { confirmationTokenHash: tokenHash },
+        select: { id: true },
+      });
+      return { id: registration.id, tokenHash };
+    }
+
+    const approval = await createPendingRegistration(event.slug, 'approve');
+    const rejection = await createPendingRegistration(event.slug, 'reject');
+    const concurrent = await createPendingRegistration(event.slug, 'concurrent');
+    const foreign = await createPendingRegistration(otherEvent.slug, 'foreign');
+    const notAttending = await submitRsvp(event.slug, rsvpBody(
+      `rsvp-decision-${suffix}-not-attending@example.test`,
+      { attendanceIntent: AttendanceIntent.NOT_ATTENDING },
+    ));
+    const notAttendingHash = createHash('sha256').update(notAttending.confirmationToken).digest('hex');
+    const notAttendingRegistration = await prisma.rSVPRegistration.findUniqueOrThrow({
+      where: { confirmationTokenHash: notAttendingHash },
+      select: { id: true },
+    });
+
+    const cancelled = await prisma.rSVPRegistration.create({
+      data: { eventId: event.id, attendanceIntent: AttendanceIntent.ATTENDING, status: RegistrationStatus.CANCELLED, cancelledAt: new Date() },
+      select: { id: true },
+    });
+
+    server = app.listen(0);
+    await new Promise<void>((resolve, reject) => {
+      server!.once('listening', resolve);
+      server!.once('error', reject);
+    });
+
+    const ownerHeaders = { Authorization: `Bearer ${accessToken(owner.id)}` };
+    const otherOwnerHeaders = { Authorization: `Bearer ${accessToken(otherOwner.id)}` };
+    const basePath = `/api/events/${event.id}/rsvps`;
+
+    const unauthenticated = await request(`${basePath}/${approval.id}/approve`, { method: 'POST' });
+    assert.equal(unauthenticated.status, 401);
+
+    const ownerApproval = await request(`${basePath}/${approval.id}/approve`, {
+      method: 'POST',
+      headers: ownerHeaders,
+    });
+    assert.equal(ownerApproval.status, 200);
+    const approvedBody = await ownerApproval.json() as {
+      registration: {
+        id: string;
+        attendanceIntent: AttendanceIntent;
+        status: RegistrationStatus;
+        relationshipToGraduate: string | null;
+        createdAt: string;
+        approvedAt: string | null;
+        declinedAt: string | null;
+        attendees: Array<{ email: string | null; phone: string | null }>;
+      };
+    };
+    assert.equal(approvedBody.registration.id, approval.id);
+    assert.equal(approvedBody.registration.attendanceIntent, AttendanceIntent.ATTENDING);
+    assert.equal(approvedBody.registration.status, RegistrationStatus.APPROVED);
+    assert.ok(approvedBody.registration.approvedAt);
+    assert.equal(approvedBody.registration.declinedAt, null);
+    assert.ok(approvedBody.registration.createdAt);
+    assert.equal(approvedBody.registration.attendees.length, 1);
+    const approvedJson = JSON.stringify(approvedBody);
+    assert.ok(!approvedJson.includes(approval.tokenHash));
+    assert.doesNotMatch(approvedJson, /confirmationToken|passwordHash/);
+
+    const ownerRejection = await request(`${basePath}/${rejection.id}/reject`, {
+      method: 'POST',
+      headers: ownerHeaders,
+    });
+    assert.equal(ownerRejection.status, 200);
+    const rejectedBody = await ownerRejection.json() as {
+      registration: { status: RegistrationStatus; approvedAt: string | null; declinedAt: string | null; attendees: unknown[] };
+    };
+    assert.equal(rejectedBody.registration.status, RegistrationStatus.DECLINED);
+    assert.equal(rejectedBody.registration.approvedAt, null);
+    assert.ok(rejectedBody.registration.declinedAt);
+    assert.equal(rejectedBody.registration.attendees.length, 1);
+
+    const foreignApproval = await request(`/api/events/${otherEvent.id}/rsvps/${foreign.id}/approve`, {
+      method: 'POST',
+      headers: ownerHeaders,
+    });
+    assert.equal(foreignApproval.status, 404);
+    const foreignRejection = await request(`/api/events/${otherEvent.id}/rsvps/${foreign.id}/reject`, {
+      method: 'POST',
+      headers: ownerHeaders,
+    });
+    assert.equal(foreignRejection.status, 404);
+    const foreignOwnerCannotDecide = await request(`/api/events/${event.id}/rsvps/${approval.id}/approve`, {
+      method: 'POST',
+      headers: otherOwnerHeaders,
+    });
+    assert.equal(foreignOwnerCannotDecide.status, 404);
+
+    const notAttendingApproval = await request(`${basePath}/${notAttendingRegistration.id}/approve`, {
+      method: 'POST',
+      headers: ownerHeaders,
+    });
+    assert.equal(notAttendingApproval.status, 409);
+    assert.deepEqual(await notAttendingApproval.json(), { message: 'Only pending registrations can be approved.' });
+
+    const repeatApproval = await request(`${basePath}/${approval.id}/approve`, { method: 'POST', headers: ownerHeaders });
+    assert.equal(repeatApproval.status, 409);
+    const approveDeclined = await request(`${basePath}/${rejection.id}/approve`, { method: 'POST', headers: ownerHeaders });
+    assert.equal(approveDeclined.status, 409);
+    const repeatRejection = await request(`${basePath}/${rejection.id}/reject`, { method: 'POST', headers: ownerHeaders });
+    assert.equal(repeatRejection.status, 409);
+    const rejectApproved = await request(`${basePath}/${approval.id}/reject`, { method: 'POST', headers: ownerHeaders });
+    assert.equal(rejectApproved.status, 409);
+
+    const cancelledDecision = await request(`${basePath}/${cancelled.id}/reject`, { method: 'POST', headers: ownerHeaders });
+    assert.equal(cancelledDecision.status, 409);
+    const notRequiredDecision = await request(`${basePath}/${notAttendingRegistration.id}/reject`, { method: 'POST', headers: ownerHeaders });
+    assert.equal(notRequiredDecision.status, 409);
+
+    const invalidRegistration = await request(`${basePath}/missing-registration-id/approve`, {
+      method: 'POST',
+      headers: ownerHeaders,
+    });
+    assert.equal(invalidRegistration.status, 404);
+
+    const bodyOverride = await request(`${basePath}/${concurrent.id}/approve`, {
+      method: 'POST',
+      headers: { ...ownerHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ownerId: otherOwner.id, status: 'DECLINED', approvedAt: null }),
+    });
+    assert.equal(bodyOverride.status, 400);
+
+    const [approveRace, rejectRace] = await Promise.all([
+      request(`${basePath}/${concurrent.id}/approve`, { method: 'POST', headers: ownerHeaders }),
+      request(`${basePath}/${concurrent.id}/reject`, { method: 'POST', headers: ownerHeaders }),
+    ]);
+    assert.deepEqual([approveRace.status, rejectRace.status].sort(), [200, 409]);
+    const finalRaceState = await prisma.rSVPRegistration.findUniqueOrThrow({
+      where: { id: concurrent.id },
+      select: { status: true, approvedAt: true, declinedAt: true },
+    });
+    assert.ok(
+      finalRaceState.status === RegistrationStatus.APPROVED ||
+      finalRaceState.status === RegistrationStatus.DECLINED,
+    );
+    assert.ok(!(finalRaceState.approvedAt && finalRaceState.declinedAt));
+  } finally {
+    if (server) {
+      await new Promise<void>((resolve, reject) => server!.close((error) => error ? reject(error) : resolve()));
+      server = undefined;
+    }
+    if (testEventIds.length) {
+      await prisma.attendanceCheckIn.deleteMany({
+        where: { ticket: { attendee: { registration: { eventId: { in: testEventIds } } } } },
+      });
+      await prisma.ticket.deleteMany({ where: { attendee: { registration: { eventId: { in: testEventIds } } } } });
+      await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: testEventIds } } } });
+      await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: testEventIds } } });
+      await prisma.event.deleteMany({ where: { id: { in: testEventIds } } });
+    }
+    if (testUserIds.length) {
+      await prisma.user.deleteMany({ where: { id: { in: testUserIds } } });
+    }
+  }
+});
+
 after(async () => {
   await prisma.$disconnect();
 });

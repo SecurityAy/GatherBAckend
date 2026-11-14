@@ -83,6 +83,28 @@ const organiserRegistrationSelect = {
   },
 } satisfies Prisma.RSVPRegistrationSelect;
 
+const organiserDecisionRegistrationSelect = {
+  id: true,
+  attendanceIntent: true,
+  status: true,
+  relationshipToGraduate: true,
+  createdAt: true,
+  approvedAt: true,
+  declinedAt: true,
+  attendees: {
+    orderBy: [{ attendeeType: 'asc' }, { createdAt: 'asc' }],
+    select: {
+      id: true,
+      firstName: true,
+      lastName: true,
+      email: true,
+      phone: true,
+      attendeeType: true,
+      createdAt: true,
+    },
+  },
+} satisfies Prisma.RSVPRegistrationSelect;
+
 type ParsedRsvp = z.infer<typeof rsvpSchema>;
 
 function splitFullName(fullName: string) {
@@ -318,6 +340,69 @@ export async function getEventRegistration(eventId: string, registrationId: stri
   }
 
   return registration;
+}
+
+export async function decideEventRegistration(
+  eventId: string,
+  registrationId: string,
+  ownerId: string,
+  decision: 'approve' | 'reject',
+) {
+  return prisma.$transaction(async (transaction) => {
+    const registration = await transaction.rSVPRegistration.findFirst({
+      where: {
+        id: registrationId,
+        eventId,
+        event: { is: { userId: ownerId, deletedAt: null } },
+      },
+      select: { id: true, attendanceIntent: true, status: true },
+    });
+
+    if (!registration) {
+      throw new HttpError(404, 'Registration not found.');
+    }
+
+    if (registration.status !== RegistrationStatus.PENDING) {
+      throw new HttpError(409, `Only pending registrations can be ${decision === 'approve' ? 'approved' : 'rejected'}.`);
+    }
+
+    if (decision === 'approve' && registration.attendanceIntent !== AttendanceIntent.ATTENDING) {
+      throw new HttpError(409, 'Only attending registrations can be approved.');
+    }
+
+    const decidedAt = new Date();
+    const updateResult = await transaction.rSVPRegistration.updateMany({
+      where: {
+        id: registration.id,
+        eventId,
+        status: RegistrationStatus.PENDING,
+        ...(decision === 'approve' ? { attendanceIntent: AttendanceIntent.ATTENDING } : {}),
+        event: { is: { userId: ownerId, deletedAt: null } },
+      },
+      data: decision === 'approve'
+        ? { status: RegistrationStatus.APPROVED, approvedAt: decidedAt, declinedAt: null }
+        : { status: RegistrationStatus.DECLINED, approvedAt: null, declinedAt: decidedAt },
+    });
+
+    if (updateResult.count !== 1) {
+      throw new HttpError(409, `Only pending registrations can be ${decision === 'approve' ? 'approved' : 'rejected'}.`);
+    }
+
+    const updatedRegistration = await transaction.rSVPRegistration.findFirst({
+      where: {
+        id: registration.id,
+        eventId,
+        event: { is: { userId: ownerId, deletedAt: null } },
+      },
+      select: organiserDecisionRegistrationSelect,
+    });
+
+    if (!updatedRegistration) {
+      throw new HttpError(404, 'Registration not found.');
+    }
+
+    return updatedRegistration;
+  });
 }
 
 export function parseRegistrationPagination(input: unknown) {

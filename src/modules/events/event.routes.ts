@@ -13,6 +13,7 @@ import {
 } from './event.service.js';
 import {
   getEventRegistration,
+  decideEventRegistration,
   getRsvpConfirmation,
   listEventRegistrations,
   parseRegistrationPagination,
@@ -59,6 +60,8 @@ const paginationSchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(100).default(20),
 }).strict();
+
+const decisionBodySchema = z.object({}).strict();
 
 eventRouter.get('/public/:slug', async (req: Request<{ slug: string }>, res, next) => {
   try {
@@ -149,8 +152,29 @@ const getRsvp = async (
   }
 };
 
+const decideRsvp = (decision: 'approve' | 'reject') => async (
+  req: Request<{ eventId: string; registrationId: string }>,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    decisionBodySchema.parse(req.body ?? {});
+    const registration = await decideEventRegistration(
+      req.params.eventId,
+      req.params.registrationId,
+      req.user!.id,
+      decision,
+    );
+    res.status(200).json({ registration });
+  } catch (error) {
+    next(error);
+  }
+};
+
 eventRouter.get('/:eventId/rsvps', listRsvps);
 eventRouter.get('/:eventId/rsvps/:registrationId', getRsvp);
+eventRouter.post('/:eventId/rsvps/:registrationId/approve', decideRsvp('approve'));
+eventRouter.post('/:eventId/rsvps/:registrationId/reject', decideRsvp('reject'));
 
 eventRouter.patch('/:id', async (req, res, next) => {
   try {

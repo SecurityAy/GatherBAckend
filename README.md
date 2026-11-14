@@ -43,8 +43,39 @@ Authenticated organiser endpoints:
 
 - `GET /api/events/:eventId/rsvps?page=1&pageSize=20`
 - `GET /api/events/:eventId/rsvps/:registrationId`
-- Both require a bearer access token and return `404` when the event or registration is not owned by the authenticated organiser.
-- The list response includes pagination metadata. No approval or decline action is provided by these endpoints.
+- `POST /api/events/:eventId/rsvps/:registrationId/approve`
+- `POST /api/events/:eventId/rsvps/:registrationId/reject`
+- All four routes require a bearer access token. The RSVP list/detail and decision routes return `404` for an event or registration the authenticated organiser cannot access.
+- The list response includes pagination metadata. Approval and rejection endpoints accept an empty body only and return `200` with the updated registration and attendee details. The response shape is:
+
+```json
+{
+  "registration": {
+    "id": "<registrationId>",
+    "attendanceIntent": "ATTENDING",
+    "status": "APPROVED",
+    "relationshipToGraduate": null,
+    "createdAt": "<ISO timestamp>",
+    "approvedAt": "<ISO timestamp>",
+    "declinedAt": null,
+    "attendees": [
+      {
+        "id": "<attendeeId>",
+        "firstName": "Ada",
+        "lastName": "Okafor",
+        "email": "ada@example.com",
+        "phone": "+234 801 234 5678",
+        "attendeeType": "PRIMARY",
+        "createdAt": "<ISO timestamp>"
+      }
+    ]
+  }
+}
+```
+
+  For rejection, `status` is `DECLINED`, `approvedAt` is `null`, and `declinedAt` contains the decision timestamp. Confirmation tokens and hashes are excluded.
+- Only `PENDING` registrations can be decided. Approval also requires `attendanceIntent: "ATTENDING"`; it sets status to `APPROVED`, `approvedAt` to the decision time, and clears `declinedAt`. Rejection sets status to `DECLINED`, `declinedAt` to the decision time, and clears `approvedAt`. Other statuses and non-attending RSVPs cannot be approved or rejected.
+- Missing or inaccessible registrations return `404` with `{ "message": "Registration not found." }`. Attempts to decide a registration outside `PENDING` return `409` with either `{ "message": "Only pending registrations can be approved." }` or `{ "message": "Only pending registrations can be rejected." }`. A pending non-attending registration, if present, returns `409` with `{ "message": "Only attending registrations can be approved." }`. Non-empty bodies return `400` with the standard validation response. Missing/invalid authentication returns `401`; inactive accounts return `403`.
 
 Public rate limits are 5 RSVP submissions per IP per hour and 20 confirmation lookups per IP per 15 minutes. They return `429` with `Retry-After`. The Express app is configured with `app.set('trust proxy', 1)` to trust the immediate single upstream reverse proxy (such as Render's default ingress) and evaluate the rightmost client IP from `X-Forwarded-For`. If additional proxy or CDN layers (such as Cloudflare) are placed in front of the service, adjust the trusted proxy hop count or CIDR configuration accordingly. Counters are in memory, are per backend process, and reset when a process restarts; they are not shared across multiple instances.
 
