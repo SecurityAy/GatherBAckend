@@ -99,6 +99,7 @@ model Event {
   coverImageUrl        String?
   rsvpDeadline         DateTime?
   additionalGuestLimit Int?
+  maxGuestCapacity     Int?
   approvalRequired     Boolean     @default(false)
   eventStatus          EventStatus @default(DRAFT)
   publishedAt          DateTime?

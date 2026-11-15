@@ -5,6 +5,7 @@ import { prisma } from '../../lib/prisma.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { env } from '../../config/env.js';
 import { enqueueNotification, notificationPayload } from '../notifications/notification-outbox.service.js';
+import { countReservedGuestSpaces, lockEventCapacity } from './capacity.service.js';
 
 const guestNameSchema = z.string().trim().min(2).max(200).refine(
   (value) => value.split(/\s+/).length >= 2,
@@ -138,6 +139,7 @@ async function findAcceptingEvent(slug: string) {
       deletedAt: true,
       approvalRequired: true,
       additionalGuestLimit: true,
+      maxGuestCapacity: true,
       rsvpDeadline: true,
       user: { select: { email: true } },
       eventDate: true,
@@ -164,21 +166,8 @@ export async function submitRsvp(slug: string, input: unknown) {
     throw new HttpError(400, 'Additional guests can only be included when attending.');
   }
 
-  if (
-    payload.attendanceIntent === AttendanceIntent.ATTENDING &&
-    event.additionalGuestLimit !== null &&
-    payload.additionalGuestNames.length > event.additionalGuestLimit
-  ) {
-    throw new HttpError(400, `This event allows at most ${event.additionalGuestLimit} additional guests.`);
-  }
-
   const token = randomBytes(32).toString('base64url');
   const confirmationTokenHash = hashConfirmationToken(token);
-  const status = payload.attendanceIntent === AttendanceIntent.NOT_ATTENDING
-    ? RegistrationStatus.NOT_REQUIRED
-    : event.approvalRequired
-      ? RegistrationStatus.PENDING
-      : RegistrationStatus.APPROVED;
   const primaryName = splitFullName(payload.primaryGuestName);
   const additionalAttendees = payload.attendanceIntent === AttendanceIntent.ATTENDING
     ? payload.additionalGuestNames.map((name) => ({
@@ -191,6 +180,7 @@ export async function submitRsvp(slug: string, input: unknown) {
 
   try {
     const registration = await prisma.$transaction(async (transaction) => {
+      await lockEventCapacity(transaction, event.id);
       await transaction.$queryRaw`SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))) AS advisory_lock`;
 
       const currentEvent = await transaction.event.findFirst({
@@ -200,11 +190,29 @@ export async function submitRsvp(slug: string, input: unknown) {
           deletedAt: null,
           OR: [{ rsvpDeadline: null }, { rsvpDeadline: { gt: new Date() } }],
         },
-        select: { id: true },
+        select: {
+          id: true,
+          title: true,
+          slug: true,
+          approvalRequired: true,
+          additionalGuestLimit: true,
+          maxGuestCapacity: true,
+          user: { select: { email: true } },
+          eventDate: true,
+          venueName: true,
+        },
       });
 
       if (!currentEvent) {
         throw new HttpError(409, 'RSVP is no longer available for this event.');
+      }
+
+      if (
+        payload.attendanceIntent === AttendanceIntent.ATTENDING &&
+        currentEvent.additionalGuestLimit !== null &&
+        payload.additionalGuestNames.length > currentEvent.additionalGuestLimit
+      ) {
+        throw new HttpError(400, `This event allows at most ${currentEvent.additionalGuestLimit} additional guests.`);
       }
 
       const recentDuplicate = await transaction.rSVPRegistration.findFirst({
@@ -224,6 +232,24 @@ export async function submitRsvp(slug: string, input: unknown) {
       if (recentDuplicate) {
         throw new HttpError(409, 'A recent RSVP for this email and event was already received.');
       }
+
+      if (payload.attendanceIntent === AttendanceIntent.ATTENDING && currentEvent.maxGuestCapacity !== null) {
+        const reservedGuestCount = await countReservedGuestSpaces(transaction, event.id);
+        const requestedGuestCount = 1 + payload.additionalGuestNames.length;
+        if (reservedGuestCount + requestedGuestCount > currentEvent.maxGuestCapacity) {
+          const availableGuestCount = Math.max(0, currentEvent.maxGuestCapacity - reservedGuestCount);
+          throw new HttpError(
+            409,
+            `This event has ${availableGuestCount} guest space${availableGuestCount === 1 ? '' : 's'} available, but this RSVP requires ${requestedGuestCount}.`,
+          );
+        }
+      }
+
+      const status = payload.attendanceIntent === AttendanceIntent.NOT_ATTENDING
+        ? RegistrationStatus.NOT_REQUIRED
+        : currentEvent.approvalRequired
+          ? RegistrationStatus.PENDING
+          : RegistrationStatus.APPROVED;
 
       const createdRegistration = await transaction.rSVPRegistration.create({
         data: {
@@ -259,18 +285,18 @@ export async function submitRsvp(slug: string, input: unknown) {
       const basePayload = {
         guestName,
         guestEmail: payload.primaryGuestEmail,
-        eventName: event.title,
+        eventName: currentEvent.title,
         attendanceIntent: payload.attendanceIntent,
         status: createdRegistration.status,
-        eventDate: event.eventDate?.toISOString() ?? null,
-        venue: event.venueName,
+        eventDate: currentEvent.eventDate?.toISOString() ?? null,
+        venue: currentEvent.venueName,
         dashboardUrl: env.frontendUrl
           ? `${env.frontendUrl.replace(/\/$/, '')}/dashboard/events/${encodeURIComponent(event.id)}/guests`
           : undefined,
-        invitationUrl: env.frontendUrl && event.slug ? `${env.frontendUrl.replace(/\/$/, '')}/event/${encodeURIComponent(event.slug)}` : undefined,
+        invitationUrl: env.frontendUrl && currentEvent.slug ? `${env.frontendUrl.replace(/\/$/, '')}/event/${encodeURIComponent(currentEvent.slug)}` : undefined,
       } as const;
-      await enqueueNotification(transaction, createdRegistration.id, NotificationType.ORGANISER_NEW_RSVP, event.user.email,
-        notificationPayload({ type: 'ORGANISER_NEW_RSVP', recipientEmail: event.user.email, ...basePayload }));
+      await enqueueNotification(transaction, createdRegistration.id, NotificationType.ORGANISER_NEW_RSVP, currentEvent.user.email,
+        notificationPayload({ type: 'ORGANISER_NEW_RSVP', recipientEmail: currentEvent.user.email, ...basePayload }));
       await enqueueNotification(transaction, createdRegistration.id, NotificationType.GUEST_RSVP_RECEIVED, payload.primaryGuestEmail,
         notificationPayload({ type: 'GUEST_RSVP_RECEIVED', recipientEmail: payload.primaryGuestEmail, ...basePayload }));
       return createdRegistration;
@@ -375,6 +401,7 @@ export async function decideEventRegistration(
 ) {
   try {
     return await prisma.$transaction(async (transaction) => {
+    await lockEventCapacity(transaction, eventId);
     const registration = await transaction.rSVPRegistration.findFirst({
       where: {
         id: registrationId,

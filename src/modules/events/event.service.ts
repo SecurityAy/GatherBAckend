@@ -2,6 +2,7 @@ import { EventStatus, Prisma } from '@prisma/client';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
 import { HttpError } from '../../middleware/errorHandler.js';
+import { capacitySummary, countReservedGuestSpaces, lockEventCapacity } from './capacity.service.js';
 
 const optionalText = (max: number) => z.string().trim().max(max).nullable().optional();
 const optionalUrl = z.string().url().max(2048).nullable().optional();
@@ -27,6 +28,7 @@ const eventFields = {
   coverImageUrl: optionalUrl,
   rsvpDeadline: optionalDate,
   additionalGuestLimit: z.number().int().min(0).max(1000).nullable().optional(),
+  maxGuestCapacity: z.number().int().min(0).max(2_147_483_647).nullable().optional(),
   approvalRequired: z.boolean().optional(),
 } satisfies z.ZodRawShape;
 
@@ -58,6 +60,7 @@ const eventSelect = {
   coverImageUrl: true,
   rsvpDeadline: true,
   additionalGuestLimit: true,
+  maxGuestCapacity: true,
   approvalRequired: true,
   eventStatus: true,
   publishedAt: true,
@@ -86,6 +89,7 @@ const publicEventSelect = {
   coverImageUrl: true,
   rsvpDeadline: true,
   additionalGuestLimit: true,
+  maxGuestCapacity: true,
 } satisfies Prisma.EventSelect;
 
 type CreateEventInput = z.infer<typeof createEventSchema>;
@@ -133,6 +137,9 @@ function toDashboardCounts(registrations: Array<{
     approvedAttendeeCount: registrations
       .filter((item) => item.status === 'APPROVED' && item.attendanceIntent === 'ATTENDING')
       .reduce((total, item) => total + item._count.attendees, 0),
+    reservedGuestCount: registrations
+      .filter((item) => (item.status === 'PENDING' || item.status === 'APPROVED') && item.attendanceIntent === 'ATTENDING')
+      .reduce((total, item) => total + item._count.attendees, 0),
   };
 }
 
@@ -171,10 +178,15 @@ export async function listEventsByUser(userId: string, page: number, pageSize: n
   const counts = await getDashboardCounts(events.map((event) => event.id));
 
   return {
-    events: events.map((event) => ({
-      ...event,
-      counts: counts.get(event.id) ?? toDashboardCounts([]),
-    })),
+    events: events.map((event) => {
+      const eventCounts = counts.get(event.id) ?? toDashboardCounts([]);
+      const { reservedGuestCount, ...dashboardCounts } = eventCounts;
+      return {
+        ...event,
+        ...capacitySummary(event.maxGuestCapacity, reservedGuestCount),
+        counts: dashboardCounts,
+      };
+    }),
     pagination: {
       page,
       pageSize,
@@ -193,7 +205,7 @@ export async function createEvent(userId: string, input: unknown) {
     const candidateSlug = attempt === 0 ? baseSlug : `${baseSlug}-${attempt + 1}`;
 
     try {
-      return await prisma.event.create({
+      const event = await prisma.event.create({
         data: {
           ...eventData,
           slug: candidateSlug,
@@ -203,6 +215,7 @@ export async function createEvent(userId: string, input: unknown) {
         },
         select: eventSelect,
       });
+      return { ...event, ...capacitySummary(event.maxGuestCapacity, 0) };
     } catch (error) {
       if (!isSlugUniqueConflict(error)) {
         throw error;
@@ -228,20 +241,28 @@ export async function getEventById(id: string, userId: string) {
     select: registrationSummarySelect,
   });
 
-  return { ...event, counts: toDashboardCounts(registrations) };
+  const counts = toDashboardCounts(registrations);
+  const { reservedGuestCount, ...dashboardCounts } = counts;
+  return {
+    ...event,
+    ...capacitySummary(event.maxGuestCapacity, reservedGuestCount),
+    counts: dashboardCounts,
+  };
 }
 
 export async function getPublicEventBySlug(slug: string) {
   const event = await prisma.event.findFirst({
     where: { slug, eventStatus: EventStatus.PUBLISHED, deletedAt: null },
-    select: publicEventSelect,
+    select: { ...publicEventSelect, id: true },
   });
 
   if (!event) {
     throw new HttpError(404, 'Event not found.');
   }
 
-  return event;
+  const reservedGuestCount = await countReservedGuestSpaces(prisma, event.id);
+  const { id: _eventId, ...publicFields } = event;
+  return { ...publicFields, ...capacitySummary(event.maxGuestCapacity, reservedGuestCount) };
 }
 
 export async function updateEvent(id: string, userId: string, input: unknown) {
@@ -250,28 +271,44 @@ export async function updateEvent(id: string, userId: string, input: unknown) {
   ensureModifiable(event.eventStatus);
   const { slug: requestedSlug, ...eventData } = payload;
 
-  if (!requestedSlug) {
-    return prisma.event.update({
-      where: { id: event.id },
-      data: eventData,
+  const updateInTransaction = (candidateSlug?: string) => prisma.$transaction(async (transaction) => {
+    await lockEventCapacity(transaction, event.id);
+    const currentEvent = await transaction.event.findFirst({
+      where: { id: event.id, userId, deletedAt: null },
       select: eventSelect,
     });
-  }
+    if (!currentEvent) throw new HttpError(404, 'Event not found.');
+    ensureModifiable(currentEvent.eventStatus);
+
+    const reservedGuestCount = await countReservedGuestSpaces(transaction, event.id);
+    if (
+      payload.maxGuestCapacity !== undefined &&
+      payload.maxGuestCapacity !== null &&
+      payload.maxGuestCapacity < reservedGuestCount
+    ) {
+      throw new HttpError(409, `Capacity cannot be lower than the ${reservedGuestCount} guest spaces already reserved.`);
+    }
+
+    const updated = await transaction.event.update({
+      where: { id: event.id },
+      data: candidateSlug === undefined
+        ? eventData
+        : { ...eventData, slug: candidateSlug },
+      select: eventSelect,
+    });
+    return { ...updated, ...capacitySummary(updated.maxGuestCapacity, reservedGuestCount) };
+  }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 10000, timeout: 15000 });
+
+  if (!requestedSlug) return updateInTransaction();
 
   const baseSlug = slugify(requestedSlug);
   for (let attempt = 0; attempt < 10; attempt += 1) {
     const candidateSlug = attempt === 0 ? baseSlug : `${baseSlug}-${attempt + 1}`;
 
     try {
-      return await prisma.event.update({
-        where: { id: event.id },
-        data: { ...eventData, slug: candidateSlug },
-        select: eventSelect,
-      });
+      return await updateInTransaction(candidateSlug);
     } catch (error) {
-      if (!isSlugUniqueConflict(error)) {
-        throw error;
-      }
+      if (!isSlugUniqueConflict(error)) throw error;
     }
   }
 

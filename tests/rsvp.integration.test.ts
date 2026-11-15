@@ -54,6 +54,12 @@ function expectHttpError(statusCode: number) {
     error.statusCode === statusCode;
 }
 
+type CapacityResponse = {
+  maxGuestCapacity: number | null;
+  reservedGuestCount: number;
+  availableGuestCount: number | null;
+};
+
 test('public RSVP validation, persistence, confirmation, ownership, and throttling', async () => {
   try {
     const [owner, otherOwner] = await Promise.all([
@@ -359,6 +365,315 @@ test('public RSVP validation, persistence, confirmation, ownership, and throttli
     if (testUserIds.length) {
       await prisma.user.deleteMany({ where: { id: { in: testUserIds } } });
     }
+  }
+});
+
+test('event guest capacity accounts for reserved attendee rows and serializes submissions and updates', async () => {
+  const suffix = randomUUID();
+  const eventIds: string[] = [];
+  const userIds: string[] = [];
+  let capacityServer: ReturnType<typeof app.listen> | undefined;
+
+  try {
+    const owner = await prisma.user.create({
+      data: {
+        firstName: 'Capacity',
+        lastName: 'Owner',
+        email: `capacity-owner-${suffix}@example.test`,
+        passwordHash: 'test-only-hash',
+      },
+    });
+    userIds.push(owner.id);
+    const ownerHeaders = { Authorization: `Bearer ${accessToken(owner.id)}` };
+
+    capacityServer = app.listen(0);
+    server = capacityServer;
+    await new Promise<void>((resolve, reject) => {
+      capacityServer!.once('listening', resolve);
+      capacityServer!.once('error', reject);
+    });
+
+    let rateLimitIp = 1;
+    const nextHeaders = () => ({
+      'Content-Type': 'application/json',
+      'X-Forwarded-For': `198.18.${Math.floor(rateLimitIp / 250)}.${rateLimitIp++ % 250 + 1}`,
+    });
+    const postSubmission = (slug: string, email: string, additionalGuestNames: string[] = [], attendanceIntent = AttendanceIntent.ATTENDING) =>
+      request(`/api/events/public/${slug}/rsvp`, {
+        method: 'POST',
+        headers: nextHeaders(),
+        body: JSON.stringify(rsvpBody(email, { additionalGuestNames, attendanceIntent })),
+      });
+
+    const event = await prisma.event.create({
+      data: {
+        userId: owner.id,
+        title: 'Capacity 100 Event',
+        slug: `capacity-100-${suffix}`,
+        eventCategory: 'Test',
+        eventStatus: EventStatus.PUBLISHED,
+        approvalRequired: true,
+        additionalGuestLimit: 100,
+        maxGuestCapacity: 100,
+      },
+    });
+    eventIds.push(event.id);
+
+    const attendeeData = (count: number) => Array.from({ length: count }, (_, index) => ({
+      firstName: `Guest${index}`,
+      lastName: 'Capacity',
+      email: index === 0 ? `capacity-fixture-${suffix}-${count}@example.test` : null,
+      attendeeType: index === 0 ? AttendeeType.PRIMARY : AttendeeType.ADDITIONAL,
+    }));
+    const pendingGroup = await prisma.rSVPRegistration.create({
+      data: {
+        eventId: event.id,
+        attendanceIntent: AttendanceIntent.ATTENDING,
+        status: RegistrationStatus.PENDING,
+        attendees: { create: attendeeData(72) },
+      },
+      select: { id: true },
+    });
+    await prisma.rSVPRegistration.create({
+      data: {
+        eventId: event.id,
+        attendanceIntent: AttendanceIntent.ATTENDING,
+        status: RegistrationStatus.CANCELLED,
+        cancelledAt: new Date(),
+        attendees: { create: attendeeData(4) },
+      },
+    });
+    await prisma.rSVPRegistration.create({
+      data: {
+        eventId: event.id,
+        attendanceIntent: AttendanceIntent.NOT_ATTENDING,
+        status: RegistrationStatus.NOT_REQUIRED,
+        attendees: { create: attendeeData(1) },
+      },
+    });
+
+    const cancelledLater = await prisma.rSVPRegistration.create({
+      data: {
+        eventId: event.id,
+        attendanceIntent: AttendanceIntent.ATTENDING,
+        status: RegistrationStatus.PENDING,
+        attendees: { create: attendeeData(2) },
+      },
+      select: { id: true },
+    });
+    const beforeCancellation = await request(`/api/events/${event.id}`, { headers: ownerHeaders });
+    assert.equal(((await beforeCancellation.json()) as { event: CapacityResponse }).event.reservedGuestCount, 74);
+    await prisma.rSVPRegistration.update({
+      where: { id: cancelledLater.id },
+      data: { status: RegistrationStatus.CANCELLED, cancelledAt: new Date() },
+    });
+    const afterCancellation = await request(`/api/events/${event.id}`, { headers: ownerHeaders });
+    assert.equal(((await afterCancellation.json()) as { event: CapacityResponse }).event.reservedGuestCount, 72);
+
+    const publicSummary = await request(`/api/events/public/${event.slug}`);
+    assert.equal(publicSummary.status, 200);
+    const publicEvent = (await publicSummary.json() as { event: CapacityResponse }).event;
+    assert.equal(publicEvent.maxGuestCapacity, 100);
+    assert.equal(publicEvent.reservedGuestCount, 72);
+    assert.equal(publicEvent.availableGuestCount, 28);
+
+    const ownerEventResponse = await request(`/api/events/${event.id}`, { headers: ownerHeaders });
+    assert.equal(ownerEventResponse.status, 200);
+    const ownerEvent = (await ownerEventResponse.json() as { event: CapacityResponse }).event;
+    assert.equal(ownerEvent.reservedGuestCount, 72);
+    assert.equal(ownerEvent.availableGuestCount, 28);
+
+    const tooLow = await request(`/api/events/${event.id}`, {
+      method: 'PATCH',
+      headers: { ...ownerHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ maxGuestCapacity: 71 }),
+    });
+    assert.equal(tooLow.status, 409);
+    assert.match((await tooLow.json()).message, /72 guest spaces already reserved/);
+
+    for (const capacity of [100, 101, 73]) {
+      const updated = await request(`/api/events/${event.id}`, {
+        method: 'PATCH',
+        headers: { ...ownerHeaders, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ maxGuestCapacity: capacity }),
+      });
+      assert.equal(updated.status, 200);
+      assert.equal(((await updated.json()) as { event: { maxGuestCapacity: number } }).event.maxGuestCapacity, capacity);
+    }
+
+    const beforeOverflowRegistrations = await prisma.rSVPRegistration.count({ where: { eventId: event.id } });
+    const beforeOverflowNotifications = await prisma.notificationOutbox.count({ where: { registration: { eventId: event.id } } });
+    const overflow = await postSubmission(event.slug, `capacity-overflow-${suffix}@example.test`, ['Extra Guest One', 'Extra Guest Two']);
+    assert.equal(overflow.status, 409);
+    assert.match((await overflow.json()).message, /1 guest space available.*requires 3/);
+    assert.equal(await prisma.rSVPRegistration.count({ where: { eventId: event.id } }), beforeOverflowRegistrations);
+    assert.equal(await prisma.notificationOutbox.count({ where: { registration: { eventId: event.id } } }), beforeOverflowNotifications);
+
+    const oneSpace = await postSubmission(event.slug, `capacity-one-${suffix}@example.test`);
+    assert.equal(oneSpace.status, 201);
+    const oneSpaceResult = await oneSpace.json() as { registration: { status: RegistrationStatus } };
+    assert.equal(oneSpaceResult.registration.status, RegistrationStatus.PENDING);
+    const fullSummary = await request(`/api/events/${event.id}`, { headers: ownerHeaders });
+    const fullEvent = (await fullSummary.json() as { event: CapacityResponse }).event;
+    assert.equal(fullEvent.reservedGuestCount, 73);
+    assert.equal(fullEvent.availableGuestCount, 0);
+
+    const oneSpaceRegistration = await prisma.rSVPRegistration.findFirstOrThrow({
+      where: { eventId: event.id, attendees: { some: { email: `capacity-one-${suffix}@example.test` } } },
+      select: { id: true },
+    });
+    const approval = await request(`/api/events/${event.id}/rsvps/${oneSpaceRegistration.id}/approve`, {
+      method: 'POST',
+      headers: ownerHeaders,
+      body: JSON.stringify({}),
+    });
+    assert.equal(approval.status, 200);
+    const afterApproval = await request(`/api/events/${event.id}`, { headers: ownerHeaders });
+    assert.equal(((await afterApproval.json()) as { event: CapacityResponse }).event.reservedGuestCount, 73);
+
+    const notAttending = await postSubmission(
+      event.slug,
+      `capacity-no-${suffix}@example.test`,
+      [],
+      AttendanceIntent.NOT_ATTENDING,
+    );
+    assert.equal(notAttending.status, 201, 'NOT_ATTENDING must remain possible when full');
+    const afterNotAttending = await request(`/api/events/${event.id}`, { headers: ownerHeaders });
+    assert.equal(((await afterNotAttending.json()) as { event: CapacityResponse }).event.reservedGuestCount, 73);
+
+    const decline = await request(`/api/events/${event.id}/rsvps/${pendingGroup.id}/reject`, {
+      method: 'POST',
+      headers: ownerHeaders,
+      body: JSON.stringify({}),
+    });
+    assert.equal(decline.status, 200);
+    const afterDecline = await request(`/api/events/${event.id}`, { headers: ownerHeaders });
+    assert.equal(((await afterDecline.json()) as { event: CapacityResponse }).event.reservedGuestCount, 1);
+
+    const createdZero = await request('/api/events', {
+      method: 'POST',
+      headers: { ...ownerHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Zero Capacity Event', eventCategory: 'Test', maxGuestCapacity: 0 }),
+    });
+    assert.equal(createdZero.status, 201);
+    const zeroEvent = (await createdZero.json() as { event: {
+      id: string;
+      slug: string;
+      maxGuestCapacity: number | null;
+      reservedGuestCount: number;
+      availableGuestCount: number | null;
+    } }).event;
+    eventIds.push(zeroEvent.id);
+    await prisma.event.update({
+      where: { id: zeroEvent.id },
+      data: { eventStatus: EventStatus.PUBLISHED, approvalRequired: true },
+    });
+    assert.equal(zeroEvent.maxGuestCapacity, 0);
+    assert.equal(zeroEvent.reservedGuestCount, 0);
+    assert.equal(zeroEvent.availableGuestCount, 0);
+
+    for (const invalidCapacity of [-1, 1.5]) {
+      const invalid = await request('/api/events', {
+        method: 'POST',
+        headers: { ...ownerHeaders, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: `Invalid Capacity ${invalidCapacity}`, eventCategory: 'Test', maxGuestCapacity: invalidCapacity }),
+      });
+      assert.equal(invalid.status, 400);
+    }
+
+    const zeroAttending = await postSubmission(zeroEvent.slug, `capacity-zero-yes-${suffix}@example.test`);
+    assert.equal(zeroAttending.status, 409);
+    const zeroNotAttending = await postSubmission(
+      zeroEvent.slug,
+      `capacity-zero-no-${suffix}@example.test`,
+      [],
+      AttendanceIntent.NOT_ATTENDING,
+    );
+    assert.equal(zeroNotAttending.status, 201);
+
+    const groupEvent = await prisma.event.create({
+      data: {
+        userId: owner.id,
+        title: 'Four Guest Capacity Event',
+        slug: `capacity-group-${suffix}`,
+        eventCategory: 'Test',
+        eventStatus: EventStatus.PUBLISHED,
+        additionalGuestLimit: 3,
+        maxGuestCapacity: 4,
+      },
+    });
+    eventIds.push(groupEvent.id);
+    const fourGuests = await postSubmission(groupEvent.slug, `capacity-group-${suffix}@example.test`, [
+      'Additional One', 'Additional Two', 'Additional Three',
+    ]);
+    assert.equal(fourGuests.status, 201);
+    const groupSummaryResponse = await request(`/api/events/${groupEvent.id}`, { headers: ownerHeaders });
+    const groupSummary = (await groupSummaryResponse.json() as { event: CapacityResponse }).event;
+    assert.equal(groupSummary.reservedGuestCount, 4);
+    assert.equal(groupSummary.availableGuestCount, 0);
+
+    const concurrentEvent = await prisma.event.create({
+      data: {
+        userId: owner.id,
+        title: 'Concurrent Capacity Event',
+        slug: `capacity-race-${suffix}`,
+        eventCategory: 'Test',
+        eventStatus: EventStatus.PUBLISHED,
+        additionalGuestLimit: 2,
+        maxGuestCapacity: 3,
+      },
+    });
+    eventIds.push(concurrentEvent.id);
+    const racingSubmissions = await Promise.all([
+      postSubmission(concurrentEvent.slug, `capacity-race-a-${suffix}@example.test`, ['Race Guest A']),
+      postSubmission(concurrentEvent.slug, `capacity-race-b-${suffix}@example.test`, ['Race Guest B']),
+    ]);
+    assert.deepEqual(racingSubmissions.map(({ status }) => status).sort(), [201, 409]);
+    const concurrentSummary = await request(`/api/events/${concurrentEvent.id}`, { headers: ownerHeaders });
+    const concurrentCapacity = (await concurrentSummary.json() as { event: CapacityResponse }).event;
+    assert.equal(concurrentCapacity.reservedGuestCount, 2);
+    assert.ok(concurrentCapacity.reservedGuestCount <= concurrentCapacity.maxGuestCapacity!);
+    assert.equal(await prisma.notificationOutbox.count({ where: { registration: { eventId: concurrentEvent.id } } }), 2);
+
+    const unlimitedEvent = await prisma.event.create({
+      data: {
+        userId: owner.id,
+        title: 'Unlimited Capacity Event',
+        slug: `capacity-unlimited-${suffix}`,
+        eventCategory: 'Test',
+        eventStatus: EventStatus.PUBLISHED,
+        additionalGuestLimit: 3,
+        maxGuestCapacity: null,
+      },
+    });
+    eventIds.push(unlimitedEvent.id);
+    const unsetCapacity = await request(`/api/events/${unlimitedEvent.id}`, {
+      method: 'PATCH',
+      headers: { ...ownerHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ maxGuestCapacity: null }),
+    });
+    assert.equal(unsetCapacity.status, 200);
+    assert.equal(((await unsetCapacity.json()) as { event: { maxGuestCapacity: number | null } }).event.maxGuestCapacity, null);
+    const unlimitedResponse = await postSubmission(unlimitedEvent.slug, `capacity-unlimited-${suffix}@example.test`, [
+      'Unlimited Guest One', 'Unlimited Guest Two', 'Unlimited Guest Three',
+    ]);
+    assert.equal(unlimitedResponse.status, 201);
+    const unlimitedSummaryResponse = await request(`/api/events/public/${unlimitedEvent.slug}`);
+    const unlimitedSummary = (await unlimitedSummaryResponse.json() as { event: CapacityResponse }).event;
+    assert.equal(unlimitedSummary.maxGuestCapacity, null);
+    assert.equal(unlimitedSummary.reservedGuestCount, 4);
+    assert.equal(unlimitedSummary.availableGuestCount, null);
+  } finally {
+    if (capacityServer) {
+      await new Promise<void>((resolve, reject) => capacityServer!.close((error) => error ? reject(error) : resolve()));
+      if (server === capacityServer) server = undefined;
+    }
+    if (eventIds.length) {
+      await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: eventIds } } } });
+      await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.event.deleteMany({ where: { id: { in: eventIds } } });
+    }
+    if (userIds.length) await prisma.user.deleteMany({ where: { id: { in: userIds } } });
   }
 });
 
