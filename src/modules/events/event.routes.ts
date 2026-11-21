@@ -14,6 +14,8 @@ import {
   updateEvent,
 } from './event.service.js';
 import {
+  cancelEventRegistration,
+  cancelRsvpByToken,
   getEventRegistration,
   decideEventRegistration,
   getRsvpConfirmation,
@@ -21,7 +23,7 @@ import {
   parseRegistrationPagination,
   submitRsvp,
 } from './rsvp.service.js';
-import { issueMissingEventTickets, listEventAttendees } from '../tickets/ticket.service.js';
+import { issueMissingEventTickets, listEventAttendees, reissueTicketForAttendee } from '../tickets/ticket.service.js';
 
 const eventRouter = Router();
 
@@ -99,6 +101,15 @@ eventRouter.post('/public/:slug/rsvp/confirmation', limitRsvpConfirmation, async
   try {
     const confirmation = await getRsvpConfirmation(req.params.slug, req.body);
     res.status(200).json({ confirmation });
+  } catch (error) {
+    next(error);
+  }
+});
+
+eventRouter.post('/public/:slug/rsvp/cancel', limitRsvpConfirmation, async (req: Request<{ slug: string }>, res, next) => {
+  try {
+    const result = await cancelRsvpByToken(req.params.slug, req.body);
+    res.status(200).json(result);
   } catch (error) {
     next(error);
   }
@@ -201,10 +212,40 @@ eventRouter.get('/:eventId/rsvps/:registrationId', getRsvp);
 eventRouter.post('/:eventId/rsvps/:registrationId/approve', decideRsvp('approve'));
 eventRouter.post('/:eventId/rsvps/:registrationId/reject', decideRsvp('reject'));
 
+eventRouter.post('/:eventId/rsvps/:registrationId/cancel', async (
+  req: Request<{ eventId: string; registrationId: string }>,
+  res,
+  next,
+) => {
+  try {
+    decisionBodySchema.parse(req.body ?? {});
+    const result = await cancelEventRegistration(req.params.eventId, req.params.registrationId, req.user!.id);
+    res.status(200).json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
 eventRouter.post('/:eventId/tickets/issue', async (req: Request<{ eventId: string }>, res, next) => {
   try {
     decisionBodySchema.parse(req.body ?? {});
     const result = await issueMissingEventTickets(req.params.eventId, req.user!.id);
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(200).json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+eventRouter.post('/:eventId/attendees/:attendeeId/tickets/reissue', async (
+  req: Request<{ eventId: string; attendeeId: string }>,
+  res,
+  next,
+) => {
+  try {
+    decisionBodySchema.parse(req.body ?? {});
+    const result = await reissueTicketForAttendee(req.params.eventId, req.params.attendeeId, req.user!.id);
+    // This response carries a raw QR token.
     res.setHeader('Cache-Control', 'no-store');
     res.status(200).json(result);
   } catch (error) {

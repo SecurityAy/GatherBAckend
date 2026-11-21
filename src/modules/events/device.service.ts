@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { Request, Response } from 'express';
 import jwt from 'jsonwebtoken';
 import { env } from '../../config/env.js';
-import type { Prisma } from '@prisma/client';
+import { RegistrationStatus, type Prisma } from '@prisma/client';
 
 export const DEVICE_COOKIE_NAME = 'gather_device';
 const DEVICE_ID_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
@@ -96,7 +96,8 @@ export function deviceRegistrationFilter(eventId: string, lookupHashes: string[]
   for (const hash of lookupHashes) {
     or.push({ deviceCookieHash: hash }, { deviceClientHash: hash });
   }
-  return { eventId, OR: or };
+  // A cancelled reservation releases the device so the guest can reserve again.
+  return { eventId, status: { not: RegistrationStatus.CANCELLED }, OR: or };
 }
 
 export function setDeviceCookie(res: Response, deviceId: string) {

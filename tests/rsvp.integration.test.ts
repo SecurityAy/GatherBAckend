@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { after, test } from 'node:test';
-import { AttendanceIntent, AttendeeType, EventStatus, NotificationStatus, NotificationType, RegistrationStatus } from '@prisma/client';
+import { AttendanceIntent, AttendeeType, EventStatus, NotificationStatus, NotificationType, RegistrationStatus, TicketStatus } from '@prisma/client';
 import jwt from 'jsonwebtoken';
 import { ZodError } from 'zod';
 import { env, readResendConfiguration } from '../src/config/env.js';
@@ -1749,6 +1749,218 @@ test('device-scoped RSVP reservations block repeats and hide the save-me-a-seat 
       assert.ok(!registration.deviceClientHash || /^[a-f0-9]{64}$/.test(registration.deviceClientHash));
     }
     assert.ok(!JSON.stringify(stored).includes(clientA), 'raw device IDs must not be persisted');
+  } finally {
+    if (localServer) {
+      await new Promise<void>((resolve, reject) => localServer!.close((error) => error ? reject(error) : resolve()));
+      if (server === localServer) server = undefined;
+    }
+    if (eventIds.length) {
+      await prisma.attendanceCheckIn.deleteMany({
+        where: { ticket: { attendee: { registration: { eventId: { in: eventIds } } } } },
+      });
+      await prisma.ticket.deleteMany({ where: { attendee: { registration: { eventId: { in: eventIds } } } } });
+      await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: eventIds } } } });
+      await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.event.deleteMany({ where: { id: { in: eventIds } } });
+    }
+    if (userIds.length) {
+      await prisma.user.deleteMany({ where: { id: { in: userIds } } });
+    }
+  }
+});
+
+test('RSVP cancellation releases capacity and device locks, and ticket reissue invalidates lost tokens', async () => {
+  const suffix = randomUUID();
+  const userIds: string[] = [];
+  const eventIds: string[] = [];
+  let localServer: ReturnType<typeof app.listen> | undefined;
+  let addressIndex = 0;
+  const nextIp = () => `198.19.${Math.floor(addressIndex / 250)}.${(addressIndex++ % 250) + 1}`;
+
+  type RsvpCreated = {
+    confirmationToken: string;
+    registration: { id: string; status: string };
+    tickets: Array<{ attendeeId: string; ticketId: string; qrToken: string }>;
+  };
+
+  try {
+    const owner = await prisma.user.create({
+      data: {
+        firstName: 'Cancel',
+        lastName: 'Owner',
+        email: `cancel-reissue-${suffix}-owner@example.test`,
+        passwordHash: 'test-only-hash',
+      },
+    });
+    const otherOwner = await prisma.user.create({
+      data: {
+        firstName: 'Other',
+        lastName: 'Owner',
+        email: `cancel-reissue-${suffix}-other@example.test`,
+        passwordHash: 'test-only-hash',
+      },
+    });
+    userIds.push(owner.id, otherOwner.id);
+
+    const event = await prisma.event.create({
+      data: {
+        userId: owner.id,
+        title: 'Cancel And Reissue Event',
+        slug: `cancel-reissue-${suffix}`,
+        eventCategory: 'Test',
+        eventStatus: EventStatus.PUBLISHED,
+        approvalRequired: false,
+        maxGuestCapacity: 1,
+      },
+    });
+    eventIds.push(event.id);
+
+    localServer = app.listen(0);
+    server = localServer;
+    await new Promise<void>((resolve, reject) => {
+      localServer!.once('listening', resolve);
+      localServer!.once('error', reject);
+    });
+
+    const publicUrl = `/api/events/public/${event.slug}`;
+    const rsvpUrl = `${publicUrl}/rsvp`;
+    const clientA = `cancel-device-a-${suffix}`;
+    const clientB = `cancel-device-b-${suffix}`;
+    const guestEmail = `cancel-reissue-${suffix}-guest@example.test`;
+
+    const submit = (deviceId: string) => request(rsvpUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Device-Id': deviceId,
+        'X-Forwarded-For': nextIp(),
+      },
+      body: JSON.stringify(rsvpBody(guestEmail)),
+    });
+    const hasReserved = async (deviceId: string) => {
+      const response = await request(publicUrl, {
+        headers: { 'X-Device-Id': deviceId, 'X-Forwarded-For': nextIp() },
+      });
+      assert.equal(response.status, 200);
+      return ((await response.json()) as { event: { hasReserved: boolean } }).event.hasReserved;
+    };
+    const cancelWithToken = (token: string) => request(`${publicUrl}/rsvp/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': nextIp() },
+      body: JSON.stringify({ token }),
+    });
+    const checkIn = (qrToken: string) => request('/api/tickets/checkin', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${accessToken(owner.id)}`,
+      },
+      body: JSON.stringify({ eventId: event.id, qrToken }),
+    });
+    const reissue = (attendeeId: string, userId = owner.id) => request(`/api/events/${event.id}/attendees/${attendeeId}/tickets/reissue`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${accessToken(userId)}`,
+      },
+      body: JSON.stringify({}),
+    });
+    const cancelAs = (registrationId: string, userId: string) => request(`/api/events/${event.id}/rsvps/${registrationId}/cancel`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${accessToken(userId)}`,
+      },
+      body: JSON.stringify({}),
+    });
+
+    assert.equal(await hasReserved(clientA), false);
+
+    const firstResponse = await submit(clientA);
+    assert.equal(firstResponse.status, 201);
+    const first = (await firstResponse.json()) as RsvpCreated;
+    assert.equal(first.tickets.length, 1);
+    assert.equal(first.registration.status, RegistrationStatus.APPROVED);
+    const lostToken = first.tickets[0].qrToken;
+
+    const capacityBlocked = await submit(clientB);
+    assert.equal(capacityBlocked.status, 409, 'a full event must reject another device');
+    assert.equal(await hasReserved(clientA), true);
+    assert.equal(await hasReserved(clientB), false);
+
+    const guestCancelled = await cancelWithToken(first.confirmationToken);
+    assert.equal(guestCancelled.status, 200);
+    const cancelResult = (await guestCancelled.json()) as { voidedTickets: number; registration: { status: string; cancelledAt: string } };
+    assert.equal(cancelResult.voidedTickets, 1);
+    assert.equal(cancelResult.registration.status, RegistrationStatus.CANCELLED);
+    assert.ok(cancelResult.registration.cancelledAt);
+
+    const cancelledCheckIn = await checkIn(lostToken);
+    assert.equal(cancelledCheckIn.status, 409, 'a cancelled registration cannot check in');
+    assert.equal(await hasReserved(clientA), false, 'cancelling releases the device lock');
+
+    const reservedAgain = await submit(clientA);
+    assert.equal(reservedAgain.status, 201, 'cancelling releases capacity and allows a fresh reservation');
+    const second = (await reservedAgain.json()) as RsvpCreated;
+    assert.notEqual(second.confirmationToken, first.confirmationToken);
+    const secondToken = second.tickets[0].qrToken;
+
+    const duplicateCancel = await cancelWithToken(first.confirmationToken);
+    assert.equal(duplicateCancel.status, 409);
+    const invalidCancel = await cancelWithToken('x'.repeat(43));
+    assert.equal(invalidCancel.status, 404);
+
+    const foreignReissue = await reissue(second.tickets[0].attendeeId, otherOwner.id);
+    assert.equal(foreignReissue.status, 404, 'reissue is owner-scoped');
+    const foreignCancel = await cancelAs(second.registration.id, otherOwner.id);
+    assert.equal(foreignCancel.status, 404, 'organiser cancel is owner-scoped');
+
+    const reissued = await reissue(second.tickets[0].attendeeId);
+    assert.equal(reissued.status, 200);
+    assert.match(reissued.headers.get('cache-control') ?? '', /no-store/);
+    const reissuedBody = (await reissued.json()) as { attendeeId: string; ticketId: string; qrToken: string };
+    assert.equal(reissuedBody.attendeeId, second.tickets[0].attendeeId);
+    assert.equal(reissuedBody.ticketId, second.tickets[0].ticketId, 'reissue replaces the token on the existing ticket');
+    assert.notEqual(reissuedBody.qrToken, secondToken);
+
+    const staleCheckIn = await checkIn(secondToken);
+    assert.equal(staleCheckIn.status, 404, 'the old token is revoked');
+    const freshCheckIn = await checkIn(reissuedBody.qrToken);
+    assert.equal(freshCheckIn.status, 200);
+    assert.equal((await freshCheckIn.json() as { attendee: { id: string } }).attendee.id, second.tickets[0].attendeeId);
+
+    const reissueAfterCheckIn = await reissue(second.tickets[0].attendeeId);
+    assert.equal(reissueAfterCheckIn.status, 409, 'checked-in tickets cannot be reissued');
+
+    const organiserCancelled = await cancelAs(second.registration.id, owner.id);
+    assert.equal(organiserCancelled.status, 200);
+    const organiserResult = (await organiserCancelled.json()) as { voidedTickets: number };
+    assert.equal(organiserResult.voidedTickets, 1);
+
+    const stored = await prisma.rSVPRegistration.findMany({
+      where: { eventId: event.id },
+      select: {
+        status: true,
+        attendees: {
+          select: { ticket: { select: { ticketStatus: true, qrTokenHash: true } } },
+        },
+      },
+    });
+    assert.equal(stored.length, 2);
+    assert.deepEqual(stored.map((item) => item.status).sort(), [RegistrationStatus.CANCELLED, RegistrationStatus.CANCELLED]);
+    const storedTickets = stored.flatMap((registration) =>
+      registration.attendees.map((attendee) => attendee.ticket).filter((ticket) => ticket !== null),
+    );
+    assert.equal(storedTickets.length, 2);
+    for (const ticket of storedTickets) {
+      assert.equal(ticket.ticketStatus, TicketStatus.VOID);
+      assert.match(ticket.qrTokenHash, /^[a-f0-9]{64}$/);
+    }
+    const allTokens = [lostToken, secondToken, reissuedBody.qrToken];
+    assert.ok(!JSON.stringify(stored).includes(lostToken));
+    assert.ok(!JSON.stringify(stored).includes(secondToken));
+    assert.ok(!JSON.stringify(stored).includes(reissuedBody.qrToken));
+    assert.ok(allTokens.every((token) => token.length > 32));
   } finally {
     if (localServer) {
       await new Promise<void>((resolve, reject) => localServer!.close((error) => error ? reject(error) : resolve()));

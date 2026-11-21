@@ -101,12 +101,22 @@ The existing `POST /api/events/:eventId/rsvps/:registrationId/approve` response 
 
 Authenticated event-owner endpoints:
 
-- `POST /api/events/:eventId/tickets/issue` issues any missing eligible tickets for the event. It is safe to call repeatedly. Returns `200` with `{ "issuedCount": 1, "tickets": [{ "attendeeId": "...", "ticketId": "...", "qrToken": "..." }] }`. Existing tickets are not recreated and their raw tokens cannot be recovered. Keep tokens private and deliver/display them only to the intended attendee.
+- `POST /api/events/:eventId/tickets/issue` issues any missing eligible tickets for the event. It is safe to call repeatedly. Returns `200` with `{ "issuedCount": 1, "tickets": [{ "attendeeId": "...", "ticketId": "...", "qrToken": "..." }] }`. Existing tickets are not recreated and their raw tokens cannot be recovered by this endpoint. Keep tokens private and deliver/display them only to the intended attendee.
+- `POST /api/events/:eventId/attendees/:attendeeId/tickets/reissue` replaces the QR token on an existing ticket for an `APPROVED`, `ATTENDING` attendee. Returns `200` with `{ "attendeeId", "ticketId", "qrToken" }` and `Cache-Control: no-store`. The old token is revoked immediately because its hash is overwritten. Checked-in, used, cancelled, and foreign-event tickets return 404/409.
 - `GET /api/events/:eventId/attendees?page=1&pageSize=50` returns `{ attendees, pagination }`. Each attendee contains `id`, `firstName`, `lastName`, `attendeeType`, `attendanceIntent`, `registrationStatus`, `hasTicket`, `checkedIn`, and `checkedInAt`. QR tokens and hashes are never included. Page size is 1–100.
 
 `POST /api/tickets/checkin` requires an authenticated owner of the supplied event and JSON `{ "eventId": "<UUID>", "qrToken": "<one-time token>" }`. It atomically marks the ticket used and creates its check-in record. It returns a safe attendee summary and `checkedInAt`; unknown/wrong-event tickets return 404 and already-used/ineligible tickets return 409. For a short client transition, `qrCode` is accepted as an alias for `qrToken`, but its value must now be a server-issued token.
 
-The former in-memory `GET /api/tickets/validate/:qrCode` route now returns 410 with migration guidance. Prototype tickets held only in process memory are not migrated or recognized. Because raw tokens are intentionally not stored, a token lost after successful issuance cannot be returned by a later idempotent issuance call; a future explicit revoke-and-reissue flow is needed for recovery.
+The former in-memory `GET /api/tickets/validate/:qrCode` route now returns 410 with migration guidance. Prototype tickets held only in process memory are not migrated or recognized. Raw tokens are intentionally not stored; a lost token is recovered through the owner-only reissue endpoint above, not by repeating idempotent issuance.
+
+## RSVP cancellation
+
+A reservation can be cancelled in two ways. Both set `status: CANCELLED` and `cancelledAt`, release the event's guest capacity, release the per-device reservation lock, and void any tickets already issued for that registration.
+
+- `POST /api/events/public/:slug/rsvp/cancel` is public and uses the confirmation token as a bearer credential: `{ "token": "<confirmationToken>" }`. It returns `200` with `{ "registration": { "id", "status", "cancelledAt" }, "voidedTickets": <number> }`. Unknown tokens return 404; cancelling twice returns 409.
+- `POST /api/events/:eventId/rsvps/:registrationId/cancel` requires an authenticated owner of the event and returns the same shape. Foreign or missing registrations return 404.
+
+The public event response's `event.hasReserved` is false again after cancellation, so the guest can reserve once more on the same event and device. Confirmation lookups continue to work for cancelled registrations so guests can see their status.
 
 ## Notes
 Authentication, event management, RSVP, ticket issuance, attendee listing, and ticket check-in use Prisma/PostgreSQL. The frontend RSVP and ticket-scanning flows are not verified as connected to these APIs. Existing QR-token delivery to guests is not implemented by this backend.

@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { AttendanceIntent, AttendeeType, EventStatus, NotificationType, Prisma, RegistrationStatus } from '@prisma/client';
+import { AttendanceIntent, AttendeeType, EventStatus, NotificationType, Prisma, RegistrationStatus, TicketStatus } from '@prisma/client';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
 import { HttpError } from '../../middleware/errorHandler.js';
@@ -237,6 +237,7 @@ export async function submitRsvp(
         where: {
           eventId: event.id,
           createdAt: { gte: duplicateWindowStart },
+          status: { not: RegistrationStatus.CANCELLED },
           attendees: {
             some: {
               attendeeType: AttendeeType.PRIMARY,
@@ -366,6 +367,96 @@ export async function getRsvpConfirmation(slug: string, input: unknown) {
   }
 
   return registration;
+}
+
+async function cancelRegistrationInTransaction(
+  transaction: Prisma.TransactionClient,
+  registration: { id: string; status: RegistrationStatus },
+) {
+  if (registration.status === RegistrationStatus.CANCELLED) {
+    throw new HttpError(409, 'This reservation has already been cancelled.');
+  }
+
+  const cancelledAt = new Date();
+  const updated = await transaction.rSVPRegistration.updateMany({
+    where: { id: registration.id, status: { not: RegistrationStatus.CANCELLED } },
+    data: { status: RegistrationStatus.CANCELLED, cancelledAt },
+  });
+  if (updated.count !== 1) {
+    throw new HttpError(409, 'This reservation has already been cancelled.');
+  }
+
+  // Cancelled registrations must not leave a usable QR token behind.
+  const voided = await transaction.ticket.updateMany({
+    where: { attendee: { registrationId: registration.id }, ticketStatus: { not: TicketStatus.VOID } },
+    data: { ticketStatus: TicketStatus.VOID },
+  });
+
+  return { cancelledAt, voidedTickets: voided.count };
+}
+
+function cancelledResult(registrationId: string, cancelledAt: Date, voidedTickets: number) {
+  return {
+    registration: {
+      id: registrationId,
+      status: RegistrationStatus.CANCELLED,
+      cancelledAt,
+    },
+    voidedTickets,
+  };
+}
+
+/** Guest-initiated cancellation. The confirmation token is the bearer credential. */
+export async function cancelRsvpByToken(slug: string, input: unknown) {
+  const { token } = confirmationSchema.parse(input);
+  const existing = await prisma.rSVPRegistration.findFirst({
+    where: {
+      confirmationTokenHash: hashConfirmationToken(token),
+      event: { is: { slug, deletedAt: null } },
+    },
+    select: { id: true, eventId: true, status: true },
+  });
+
+  if (!existing) {
+    throw new HttpError(404, 'RSVP confirmation not found.');
+  }
+
+  return prisma.$transaction(async (transaction) => {
+    await lockEventCapacity(transaction, existing.eventId);
+    const registration = await transaction.rSVPRegistration.findFirst({
+      where: { id: existing.id, eventId: existing.eventId },
+      select: { id: true, status: true },
+    });
+    if (!registration) {
+      throw new HttpError(404, 'RSVP confirmation not found.');
+    }
+    const outcome = await cancelRegistrationInTransaction(transaction, registration);
+    return cancelledResult(registration.id, outcome.cancelledAt, outcome.voidedTickets);
+  }, { maxWait: 10000, timeout: 30000 });
+}
+
+/** Organiser-initiated cancellation, scoped to an owned, non-deleted event. */
+export async function cancelEventRegistration(
+  eventId: string,
+  registrationId: string,
+  ownerId: string,
+) {
+  return prisma.$transaction(async (transaction) => {
+    await lockEventCapacity(transaction, eventId);
+    const registration = await transaction.rSVPRegistration.findFirst({
+      where: {
+        id: registrationId,
+        eventId,
+        event: { is: { userId: ownerId, deletedAt: null } },
+      },
+      select: { id: true, status: true },
+    });
+    if (!registration) {
+      throw new HttpError(404, 'Registration not found.');
+    }
+    const outcome = await cancelRegistrationInTransaction(transaction, registration);
+    return cancelledResult(registration.id, outcome.cancelledAt, outcome.voidedTickets);
+  }, { maxWait: 10000, timeout: 30000 });
 }
 
 export async function listEventRegistrations(

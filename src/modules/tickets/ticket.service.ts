@@ -75,6 +75,68 @@ export async function issueMissingEventTickets(eventId: string, ownerId: string)
   }, { maxWait: 10000, timeout: 30000 });
 }
 
+/**
+ * Replaces a lost ticket token with a fresh one. The old hash is overwritten, which
+ * revokes the old token immediately. Never returns the raw token except to the caller.
+ */
+export async function reissueTicketForAttendee(eventId: string, attendeeId: string, ownerId: string) {
+  return prisma.$transaction(async (tx) => {
+    const event = await tx.event.findFirst({
+      where: { id: eventId, userId: ownerId, deletedAt: null },
+      select: { id: true },
+    });
+    if (!event) throw new HttpError(404, 'Event not found.');
+
+    await lockEventCapacity(tx, event.id);
+    const attendee = await tx.attendee.findFirst({
+      where: {
+        id: attendeeId,
+        registration: {
+          eventId: event.id,
+          status: RegistrationStatus.APPROVED,
+          attendanceIntent: AttendanceIntent.ATTENDING,
+        },
+      },
+      select: {
+        id: true,
+        ticket: {
+          select: {
+            id: true,
+            ticketStatus: true,
+            attendance: { select: { checkedInAt: true } },
+          },
+        },
+      },
+    });
+    if (!attendee) throw new HttpError(404, 'Eligible attendee not found for this event.');
+    if (attendee.ticket?.attendance) {
+      throw new HttpError(409, 'A checked-in ticket cannot be reissued.');
+    }
+    if (attendee.ticket?.ticketStatus === TicketStatus.USED) {
+      throw new HttpError(409, 'A used ticket cannot be reissued.');
+    }
+
+    const qrToken = randomBytes(32).toString('base64url');
+    const qrTokenHash = hashQrToken(qrToken);
+    let ticketId: string;
+    if (attendee.ticket) {
+      await tx.ticket.update({
+        where: { id: attendee.ticket.id },
+        data: { qrTokenHash, ticketStatus: TicketStatus.ISSUED, usedAt: null },
+      });
+      ticketId = attendee.ticket.id;
+    } else {
+      const created = await tx.ticket.create({
+        data: { attendeeId: attendee.id, qrTokenHash },
+        select: { id: true },
+      });
+      ticketId = created.id;
+    }
+
+    return { attendeeId: attendee.id, ticketId, qrToken };
+  }, { maxWait: 10000, timeout: 30000 });
+}
+
 export async function listEventAttendees(eventId: string, ownerId: string, page: number, pageSize: number) {
   const where = { registration: { eventId, event: { is: { userId: ownerId, deletedAt: null } } } };
   const event = await prisma.event.findFirst({
