@@ -264,11 +264,17 @@ export async function getPublicEventBySlug(slug: string, device?: DeviceContext)
   const reservedGuestCount = await countReservedGuestSpaces(prisma, event.id);
   let hasReserved = false;
   if (device && device.lookupHashes.length > 0) {
-    const existingRegistration = await prisma.rSVPRegistration.findFirst({
-      where: deviceRegistrationFilter(event.id, device.lookupHashes),
-      select: { id: true },
-    });
-    hasReserved = Boolean(existingRegistration);
+    try {
+      const existingRegistration = await prisma.rSVPRegistration.findFirst({
+        where: deviceRegistrationFilter(event.id, device.lookupHashes),
+        select: { id: true },
+      });
+      hasReserved = Boolean(existingRegistration);
+    } catch (error) {
+      // If the device-hash migration has not been applied yet, keep the public page
+      // working and treat the visitor as a new device instead of returning a 500.
+      console.error('Device reservation lookup failed; treating the visitor as a new device.', error);
+    }
   }
   const { id: _eventId, ...publicFields } = event;
   return {
