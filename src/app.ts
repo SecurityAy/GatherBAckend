@@ -77,8 +77,8 @@ app.use(cors({
     callback(null, false);
   },
   methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Authorization', 'Content-Type'],
-  credentials: false,
+  allowedHeaders: ['Authorization', 'Content-Type', 'x-device-id'],
+  credentials: true,
   optionsSuccessStatus: 204,
 }));
 app.use(express.json());
