@@ -115,15 +115,27 @@ export async function reissueTicketForAttendee(eventId: string, attendeeId: stri
     if (attendee.ticket?.ticketStatus === TicketStatus.USED) {
       throw new HttpError(409, 'A used ticket cannot be reissued.');
     }
+    if (attendee.ticket?.ticketStatus === TicketStatus.VOID) {
+      throw new HttpError(409, 'A void ticket cannot be reissued.');
+    }
 
     const qrToken = randomBytes(32).toString('base64url');
     const qrTokenHash = hashQrToken(qrToken);
     let ticketId: string;
     if (attendee.ticket) {
-      await tx.ticket.update({
-        where: { id: attendee.ticket.id },
+      // Conditional update defends against a scan that bypasses the advisory lock:
+      // only a still-issued, unscanned ticket may rotate its token.
+      const rotated = await tx.ticket.updateMany({
+        where: {
+          id: attendee.ticket.id,
+          ticketStatus: TicketStatus.ISSUED,
+          attendance: { is: null },
+        },
         data: { qrTokenHash, ticketStatus: TicketStatus.ISSUED, usedAt: null },
       });
+      if (rotated.count !== 1) {
+        throw new HttpError(409, 'This ticket is no longer eligible for reissue.');
+      }
       ticketId = attendee.ticket.id;
     } else {
       const created = await tx.ticket.create({
@@ -132,6 +144,16 @@ export async function reissueTicketForAttendee(eventId: string, attendeeId: stri
       });
       ticketId = created.id;
     }
+
+    await tx.auditLog.create({
+      data: {
+        actorId: ownerId,
+        eventId: event.id,
+        action: 'TICKET_REISSUED',
+        // Never persist the raw token; only the non-secret ticket identity is recorded.
+        details: JSON.stringify({ ticketId, attendeeId: attendee.id }),
+      },
+    });
 
     return { attendeeId: attendee.id, ticketId, qrToken };
   }, { maxWait: 10000, timeout: 30000 });
@@ -157,7 +179,7 @@ export async function listEventAttendees(eventId: string, ownerId: string, page:
         lastName: true,
         attendeeType: true,
         registration: { select: { attendanceIntent: true, status: true } },
-        ticket: { select: { id: true, attendance: { select: { checkedInAt: true } } } },
+        ticket: { select: { id: true, ticketStatus: true, attendance: { select: { checkedInAt: true } } } },
       },
     }),
     prisma.attendee.count({ where }),
@@ -169,6 +191,7 @@ export async function listEventAttendees(eventId: string, ownerId: string, page:
       attendanceIntent: registration.attendanceIntent,
       registrationStatus: registration.status,
       hasTicket: ticket !== null,
+      ticketStatus: ticket?.ticketStatus ?? null,
       checkedIn: ticket?.attendance !== null && ticket?.attendance !== undefined,
       checkedInAt: ticket?.attendance?.checkedInAt ?? null,
     })),
@@ -178,6 +201,7 @@ export async function listEventAttendees(eventId: string, ownerId: string, page:
 
 type ScanTicket = {
   id: string;
+  qrTokenHash: string;
   ticketStatus: TicketStatus;
   attendance: { checkedInAt: Date } | null;
   attendee: {
@@ -202,6 +226,7 @@ async function findOwnedScanTicket(
     },
     select: {
       id: true,
+      qrTokenHash: true,
       ticketStatus: true,
       attendance: { select: { checkedInAt: true } },
       attendee: {
@@ -219,10 +244,18 @@ async function findOwnedScanTicket(
 
 function ensureEligibleScanTicket(ticket: ScanTicket | null) {
   if (!ticket) throw new HttpError(404, 'Ticket not found for this event.');
+  if (ticket.attendee.registration.status === RegistrationStatus.CANCELLED) {
+    throw new HttpError(409, 'This reservation has been cancelled.');
+  }
   if (ticket.attendee.registration.status !== RegistrationStatus.APPROVED ||
-      ticket.attendee.registration.attendanceIntent !== AttendanceIntent.ATTENDING ||
-      ticket.ticketStatus !== TicketStatus.ISSUED || ticket.attendance) {
+      ticket.attendee.registration.attendanceIntent !== AttendanceIntent.ATTENDING) {
     throw new HttpError(409, 'This ticket is not eligible for check-in.');
+  }
+  if (ticket.ticketStatus === TicketStatus.VOID) {
+    throw new HttpError(409, 'This ticket has been voided and cannot be checked in.');
+  }
+  if (ticket.ticketStatus === TicketStatus.USED || ticket.attendance) {
+    throw new HttpError(409, 'This ticket has already been checked in.');
   }
   return ticket;
 }
@@ -240,16 +273,41 @@ function safeScanSummary(ticket: ScanTicket) {
 
 export async function checkInEventTicket(eventId: string, ownerId: string, qrToken: string) {
   return prisma.$transaction(async (tx) => {
+    // Serialize scans with reissue, cancellation and issuance for this event so a
+    // token rotation cannot land between validation and the state transition.
+    await lockEventCapacity(tx, eventId);
     const ticket = ensureEligibleScanTicket(await findOwnedScanTicket(tx, eventId, ownerId, qrToken));
+    // Match the exact token hash as well as the status: if a reissue rotated the
+    // token after validation, the in-flight scan must fail rather than consume it.
     const claimed = await tx.ticket.updateMany({
-      where: { id: ticket.id, ticketStatus: TicketStatus.ISSUED },
+      where: {
+        id: ticket.id,
+        qrTokenHash: ticket.qrTokenHash,
+        ticketStatus: TicketStatus.ISSUED,
+        attendance: { is: null },
+      },
       data: { ticketStatus: TicketStatus.USED, usedAt: new Date() },
     });
-    if (claimed.count !== 1) throw new HttpError(409, 'This ticket is not eligible for check-in.');
+    if (claimed.count !== 1) {
+      throw new HttpError(409, 'This ticket is no longer eligible for check-in.');
+    }
 
     const checkIn = await tx.attendanceCheckIn.create({
       data: { ticketId: ticket.id, checkedInByUserId: ownerId },
       select: { checkedInAt: true },
+    });
+    await tx.auditLog.create({
+      data: {
+        actorId: ownerId,
+        eventId,
+        action: 'TICKET_CHECKED_IN',
+        // Record the non-secret identities and time; the QR token is never stored.
+        details: JSON.stringify({
+          ticketId: ticket.id,
+          attendeeId: ticket.attendee.id,
+          checkedInAt: checkIn.checkedInAt.toISOString(),
+        }),
+      },
     });
     return { message: 'Guest checked in successfully.', ...safeScanSummary(ticket), checkedInAt: checkIn.checkedInAt };
   }, { maxWait: 10000, timeout: 15000 });

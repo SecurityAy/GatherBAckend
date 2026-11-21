@@ -2124,6 +2124,197 @@ test('database enforces sliding duplicate RSVP window and active device uniquene
   }
 });
 
+test('ticket check-in is atomic, audited, and safe against void and reissue races', async () => {
+  const localSuffix = randomUUID();
+  const userIds: string[] = [];
+  const eventIds: string[] = [];
+  let localServer: ReturnType<typeof app.listen> | undefined;
+  let addressIndex = 0;
+  const nextIp = () => `198.30.${Math.floor(addressIndex / 250)}.${(addressIndex++ % 250) + 1}`;
+
+  try {
+    const owner = await prisma.user.create({
+      data: {
+        firstName: 'Checkin',
+        lastName: 'Owner',
+        email: `checkin-${localSuffix}-owner@example.test`,
+        passwordHash: 'test-only-hash',
+      },
+    });
+    userIds.push(owner.id);
+
+    const event = await prisma.event.create({
+      data: {
+        userId: owner.id,
+        title: 'Check-in Atomicity Event',
+        slug: `checkin-atomicity-${localSuffix}`,
+        eventCategory: 'Test',
+        eventStatus: EventStatus.PUBLISHED,
+        approvalRequired: false,
+        maxGuestCapacity: 20,
+      },
+    });
+    eventIds.push(event.id);
+
+    const otherEvent = await prisma.event.create({
+      data: {
+        userId: owner.id,
+        title: 'Other Check-in Event',
+        slug: `checkin-other-${localSuffix}`,
+        eventCategory: 'Test',
+        eventStatus: EventStatus.PUBLISHED,
+        approvalRequired: false,
+      },
+    });
+    eventIds.push(otherEvent.id);
+
+    localServer = app.listen(0);
+    server = localServer;
+    await new Promise<void>((resolve, reject) => {
+      localServer!.once('listening', resolve);
+      localServer!.once('error', reject);
+    });
+
+    const ownerHeaders = {
+      Authorization: `Bearer ${accessToken(owner.id)}`,
+      'Content-Type': 'application/json',
+    };
+    const submit = async (label: string) => {
+      const response = await request(`/api/events/public/${event.slug}/rsvp`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Device-Id': `checkin-${label}-${localSuffix}`,
+          'X-Forwarded-For': nextIp(),
+        },
+        body: JSON.stringify(rsvpBody(`checkin-${label}-${localSuffix}@example.test`)),
+      });
+      assert.equal(response.status, 201);
+      return response.json() as Promise<{
+        registration: { id: string };
+        tickets: Array<{ attendeeId: string; ticketId: string; qrToken: string }>;
+      }>;
+    };
+    const checkIn = (eventId: string, qrToken: string) => request('/api/tickets/checkin', {
+      method: 'POST',
+      headers: ownerHeaders,
+      body: JSON.stringify({ eventId, qrToken }),
+    });
+    const reissue = (attendeeId: string) => request(`/api/events/${event.id}/attendees/${attendeeId}/tickets/reissue`, {
+      method: 'POST',
+      headers: ownerHeaders,
+    });
+
+    const first = await submit('first');
+    const firstTicket = first.tickets[0];
+    assert.ok(firstTicket, 'auto-approved attendance must issue a ticket');
+
+    const wrongEvent = await checkIn(otherEvent.id, firstTicket.qrToken);
+    assert.equal(wrongEvent.status, 404, 'a valid token must not check in against a different event');
+    const invalidToken = await checkIn(event.id, 'x'.repeat(48));
+    assert.equal(invalidToken.status, 404);
+
+    const [scanA, scanB] = await Promise.all([
+      checkIn(event.id, firstTicket.qrToken),
+      checkIn(event.id, firstTicket.qrToken),
+    ]);
+    assert.deepEqual([scanA.status, scanB.status].sort(), [200, 409]);
+    const checkInRows = await prisma.attendanceCheckIn.count({ where: { ticketId: firstTicket.ticketId } });
+    assert.equal(checkInRows, 1, 'concurrent scans must create exactly one check-in');
+
+    const auditLogs = await prisma.auditLog.findMany({
+      where: { eventId: event.id, action: 'TICKET_CHECKED_IN' },
+      select: { actorId: true, details: true },
+    });
+    assert.equal(auditLogs.length, 1);
+    assert.equal(auditLogs[0].actorId, owner.id);
+    assert.ok(auditLogs[0].details?.includes(firstTicket.ticketId));
+    assert.ok(!auditLogs[0].details?.includes(firstTicket.qrToken));
+
+    const repeated = await checkIn(event.id, firstTicket.qrToken);
+    assert.equal(repeated.status, 409);
+    assert.match((await repeated.json() as { message: string }).message, /already been checked in/);
+
+    const second = await submit('void');
+    await prisma.ticket.update({
+      where: { id: second.tickets[0].ticketId },
+      data: { ticketStatus: TicketStatus.VOID },
+    });
+    const voidScan = await checkIn(event.id, second.tickets[0].qrToken);
+    assert.equal(voidScan.status, 409);
+    assert.match((await voidScan.json() as { message: string }).message, /voided/);
+    const voidReissue = await reissue(second.tickets[0].attendeeId);
+    assert.equal(voidReissue.status, 409);
+
+    const cancelled = await submit('cancelled');
+    await prisma.rSVPRegistration.update({
+      where: { id: cancelled.registration.id },
+      data: { status: RegistrationStatus.CANCELLED, cancelledAt: new Date() },
+    });
+    const cancelledScan = await checkIn(event.id, cancelled.tickets[0].qrToken);
+    assert.equal(cancelledScan.status, 409);
+    assert.match((await cancelledScan.json() as { message: string }).message, /reservation has been cancelled/);
+
+    const ineligible = await submit('ineligible');
+    await prisma.rSVPRegistration.update({
+      where: { id: ineligible.registration.id },
+      data: { status: RegistrationStatus.PENDING },
+    });
+    const ineligibleScan = await checkIn(event.id, ineligible.tickets[0].qrToken);
+    assert.equal(ineligibleScan.status, 409);
+    assert.match((await ineligibleScan.json() as { message: string }).message, /not eligible for check-in/);
+
+    const third = await submit('race');
+    const thirdTicket = third.tickets[0];
+    const [raceScan, raceReissue] = await Promise.all([
+      checkIn(event.id, thirdTicket.qrToken),
+      reissue(thirdTicket.attendeeId),
+    ]);
+    assert.equal([raceScan.status, raceReissue.status].filter((status) => status === 200).length, 1);
+    assert.ok([raceScan.status, raceReissue.status].every((status) => [200, 404, 409].includes(status)));
+
+    const storedRaceTicket = await prisma.ticket.findUnique({
+      where: { id: thirdTicket.ticketId },
+      select: { ticketStatus: true },
+    });
+    if (raceScan.status === 200) {
+      assert.equal(storedRaceTicket?.ticketStatus, TicketStatus.USED);
+    } else {
+      assert.equal(raceReissue.status, 200);
+      assert.equal(raceScan.status, 404, 'the rotated old token must be rejected');
+      assert.equal(storedRaceTicket?.ticketStatus, TicketStatus.ISSUED);
+      const rotated = await raceReissue.json() as { qrToken: string };
+      const freshScan = await checkIn(event.id, rotated.qrToken);
+      assert.equal(freshScan.status, 200);
+    }
+
+    const attendeeList = await request(`/api/events/${event.id}/attendees`, { headers: ownerHeaders });
+    assert.equal(attendeeList.status, 200);
+    const listed = await attendeeList.json() as { attendees: Array<{ id: string; ticketStatus: TicketStatus | null }> };
+    const listedFirst = listed.attendees.find((attendee) => attendee.id === firstTicket.attendeeId);
+    assert.equal(listedFirst?.ticketStatus, TicketStatus.USED);
+    assert.doesNotMatch(JSON.stringify(listed), /qrToken|qrTokenHash/);
+  } finally {
+    if (localServer) {
+      await new Promise<void>((resolve, reject) => localServer!.close((error) => error ? reject(error) : resolve()));
+      if (server === localServer) server = undefined;
+    }
+    if (eventIds.length) {
+      await prisma.auditLog.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.attendanceCheckIn.deleteMany({
+        where: { ticket: { attendee: { registration: { eventId: { in: eventIds } } } } },
+      });
+      await prisma.ticket.deleteMany({ where: { attendee: { registration: { eventId: { in: eventIds } } } } });
+      await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: eventIds } } } });
+      await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.event.deleteMany({ where: { id: { in: eventIds } } });
+    }
+    if (userIds.length) {
+      await prisma.user.deleteMany({ where: { id: { in: userIds } } });
+    }
+  }
+});
+
 after(async () => {
   await prisma.$disconnect();
 });
