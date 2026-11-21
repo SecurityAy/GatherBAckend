@@ -33,6 +33,8 @@ Public RSVP submission:
 - Returns `201` with the registration summary and a one-time confirmation token. The database stores only its SHA-256 hash.
 - Returns `400` for invalid input, `404` when the event is unavailable, `409` after the RSVP deadline or for a recent duplicate, and `429` when rate limited.
 
+Duplicate protection is rule-based: one registration per event and primary email in any five-minute sliding window, and one active reservation per event and device hash. Email comparison is case-insensitive; cancelled registrations release both the email window and the device lock. Application checks return friendly `409` responses, and database constraints enforce the same rules if concurrent requests bypass the checks.
+
 Public confirmation lookup:
 
 - `POST /api/events/public/:slug/rsvp/confirmation`
@@ -91,7 +93,7 @@ Run the RSVP integration test with `npm test`. It uses the configured PostgreSQL
 
 RSVP creation and organiser decisions write idempotent notification jobs to the PostgreSQL outbox in the same transaction as the RSVP change. A background worker sends the four transactional notification types through Resend and retries transient failures up to five attempts. Without `RESEND_API_KEY`, jobs remain pending and RSVP operations continue normally. Configure `RESEND_API_KEY` and `RESEND_FROM_EMAIL` in the backend environment; the default sender is `onboarding@resend.dev`, which Resend restricts to verified test recipients. `FRONTEND_URL` is optional and is used only to form public invitation links. Additional guests are not emailed.
 
-For safe local integration tests, put the disposable Neon test database URLs in ignored `.env.test.local` and run `npm run test:safe`. The runner validates both URLs point to Neon database `gather_rsvp_test`, applies migrations to that database, then runs the suite. It requires no production `.env` database fallback.
+For safe local integration tests, put the disposable Neon test database URLs in ignored `.env.test.local` and run `npm run test:safe`. The runner validates both URLs point to Neon database `gather_rsvp_test`, applies migrations to that database, then runs the suite. It requires no production `.env` database fallback. Production migrations are not applied by this runner or by Vercel; run `prisma migrate deploy` with production `DATABASE_URL` and `DIRECT_URL` as a separate deployment step. The `20261121130000_enforce_rsvp_duplicate_rules` migration requires PostgreSQL 14+ for `sha256()` and the `btree_gist` extension.
 
 ## Individual attendee tickets and check-in
 

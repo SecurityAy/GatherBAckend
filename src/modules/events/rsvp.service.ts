@@ -121,9 +121,27 @@ function hashConfirmationToken(token: string) {
   return createHash('sha256').update(token, 'utf8').digest('hex');
 }
 
+function hashPrimaryEmail(email: string) {
+  return createHash('sha256').update(email.trim().toLowerCase(), 'utf8').digest('hex');
+}
+
 function isRegistrationConflict(error: unknown) {
-  return error instanceof Prisma.PrismaClientKnownRequestError &&
-    (error.code === 'P2002' || error.code === 'P2034');
+  if (error instanceof Prisma.PrismaClientKnownRequestError) {
+    if (error.code === 'P2002' || error.code === 'P2034') return true;
+    // Some PostgreSQL constraint violations are reported as P2010.
+    if (error.code === 'P2010') {
+      return error.meta?.code === '23P01' ||
+        String(error.meta?.message ?? '').includes('exclusion constraint');
+    }
+    return false;
+  }
+
+  // Prisma reports exclusion-constraint violations (SQLSTATE 23P01) as an
+  // unknown request error with no code/meta, so inspect the safe error text.
+  if (error instanceof Prisma.PrismaClientUnknownRequestError) {
+    return /23P01|exclusion constraint|conflicting key value/i.test(error.message);
+  }
+  return false;
 }
 
 async function findAcceptingEvent(slug: string) {
@@ -182,7 +200,8 @@ export async function submitRsvp(
     }))
     : [];
   const duplicateWindowStart = new Date(Date.now() - 5 * 60 * 1000);
-  const lockKey = `${event.id}:${payload.primaryGuestEmail}`;
+  // Normalize the advisory-lock key to match the case-insensitive duplicate rule.
+  const lockKey = `${event.id}:${payload.primaryGuestEmail.trim().toLowerCase()}`;
 
   try {
     const result = await prisma.$transaction(async (transaction) => {
@@ -277,6 +296,7 @@ export async function submitRsvp(
           status,
           relationshipToGraduate: payload.relationshipToGraduate ?? null,
           confirmationTokenHash,
+          primaryEmailHash: hashPrimaryEmail(payload.primaryGuestEmail),
           deviceCookieHash: device.cookieHash,
           deviceClientHash: device.clientHash ?? null,
           attendees: {

@@ -122,6 +122,8 @@ model RSVPRegistration {
   status                 RegistrationStatus
   relationshipToGraduate String?
   confirmationTokenHash  String?            @unique @db.Char(64)
+  // SHA-256 of the trimmed, lowercased primary guest email; backs the duplicate-RSVP exclusion constraint.
+  primaryEmailHash       String?            @db.Char(64)
   deviceCookieHash       String?            @db.Char(64)
   deviceClientHash       String?            @db.Char(64)
   approvedAt             DateTime?

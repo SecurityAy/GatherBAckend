@@ -1981,6 +1981,149 @@ test('RSVP cancellation releases capacity and device locks, and ticket reissue i
   }
 });
 
+test('database enforces sliding duplicate RSVP window and active device uniqueness', async () => {
+  const localSuffix = randomUUID();
+  const userIds: string[] = [];
+  const eventIds: string[] = [];
+  let localServer: ReturnType<typeof app.listen> | undefined;
+  let addressIndex = 0;
+  const nextIp = () => `198.20.${Math.floor(addressIndex / 250)}.${(addressIndex++ % 250) + 1}`;
+
+  try {
+    const owner = await prisma.user.create({
+      data: {
+        firstName: 'Duplicate',
+        lastName: 'Owner',
+        email: `duplicate-${localSuffix}-owner@example.test`,
+        passwordHash: 'test-only-hash',
+      },
+    });
+    userIds.push(owner.id);
+
+    const event = await prisma.event.create({
+      data: {
+        userId: owner.id,
+        title: 'Duplicate Protection Event',
+        slug: `duplicate-protection-${localSuffix}`,
+        eventCategory: 'Test',
+        eventStatus: EventStatus.PUBLISHED,
+        approvalRequired: false,
+        maxGuestCapacity: 10,
+      },
+    });
+    eventIds.push(event.id);
+
+    localServer = app.listen(0);
+    server = localServer;
+    await new Promise<void>((resolve, reject) => {
+      localServer!.once('listening', resolve);
+      localServer!.once('error', reject);
+    });
+
+    const submit = (email: string, deviceId: string) => request(`/api/events/public/${event.slug}/rsvp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Device-Id': deviceId,
+        'X-Forwarded-For': nextIp(),
+      },
+      body: JSON.stringify(rsvpBody(email)),
+    });
+
+    const sharedEmail = `duplicate-${localSuffix}@example.test`;
+    const emailRace = await Promise.all([
+      submit(sharedEmail.toUpperCase(), `duplicate-email-a-${localSuffix}`),
+      submit(sharedEmail.toLowerCase(), `duplicate-email-b-${localSuffix}`),
+    ]);
+    assert.deepEqual(emailRace.map((response) => response.status).sort(), [201, 409]);
+
+    const sharedDevice = `duplicate-device-${localSuffix}`;
+    const deviceRace = await Promise.all([
+      submit(`duplicate-device-a-${localSuffix}@example.test`, sharedDevice),
+      submit(`duplicate-device-b-${localSuffix}@example.test`, sharedDevice),
+    ]);
+    assert.deepEqual(deviceRace.map((response) => response.status).sort(), [201, 409]);
+
+    const emailHash = createHash('sha256').update(`direct-email-${localSuffix}`, 'utf8').digest('hex');
+    await prisma.rSVPRegistration.create({
+      data: {
+        eventId: event.id,
+        attendanceIntent: AttendanceIntent.ATTENDING,
+        status: RegistrationStatus.PENDING,
+        primaryEmailHash: emailHash,
+      },
+    });
+    await assert.rejects(
+      prisma.rSVPRegistration.create({
+        data: {
+          eventId: event.id,
+          attendanceIntent: AttendanceIntent.ATTENDING,
+          status: RegistrationStatus.PENDING,
+          primaryEmailHash: emailHash,
+        },
+      }),
+      (error: unknown) => error instanceof Error && /constraint|conflict|duplicate/i.test(error.message),
+      'the database must reject overlapping duplicate email registrations without advisory locks',
+    );
+
+    const deviceHash = createHash('sha256').update(`direct-device-${localSuffix}`, 'utf8').digest('hex');
+    await prisma.rSVPRegistration.create({
+      data: {
+        eventId: event.id,
+        attendanceIntent: AttendanceIntent.ATTENDING,
+        status: RegistrationStatus.PENDING,
+        deviceCookieHash: deviceHash,
+      },
+    });
+    await assert.rejects(
+      prisma.rSVPRegistration.create({
+        data: {
+          eventId: event.id,
+          attendanceIntent: AttendanceIntent.ATTENDING,
+          status: RegistrationStatus.PENDING,
+          deviceCookieHash: deviceHash,
+        },
+      }),
+      (error: unknown) => error instanceof Error && /constraint|conflict|duplicate/i.test(error.message),
+      'the database must reject a second active registration for the same device hash',
+    );
+
+    await prisma.rSVPRegistration.create({
+      data: {
+        eventId: event.id,
+        attendanceIntent: AttendanceIntent.ATTENDING,
+        status: RegistrationStatus.CANCELLED,
+        deviceCookieHash: deviceHash,
+      },
+    });
+
+    const stored = await prisma.rSVPRegistration.findMany({
+      where: { eventId: event.id },
+      select: { status: true, primaryEmailHash: true, deviceCookieHash: true },
+    });
+    assert.equal(stored.length, 5);
+    assert.equal(stored.filter((row) => row.status === RegistrationStatus.CANCELLED).length, 1);
+    assert.ok(stored.every((row) => !row.primaryEmailHash || /^[a-f0-9]{64}$/.test(row.primaryEmailHash)));
+  } finally {
+    if (localServer) {
+      await new Promise<void>((resolve, reject) => localServer!.close((error) => error ? reject(error) : resolve()));
+      if (server === localServer) server = undefined;
+    }
+    if (eventIds.length) {
+      await prisma.attendanceCheckIn.deleteMany({
+        where: { ticket: { attendee: { registration: { eventId: { in: eventIds } } } } },
+      });
+      await prisma.ticket.deleteMany({ where: { attendee: { registration: { eventId: { in: eventIds } } } } });
+      await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: eventIds } } } });
+      await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.event.deleteMany({ where: { id: { in: eventIds } } });
+    }
+    if (userIds.length) {
+      await prisma.user.deleteMany({ where: { id: { in: userIds } } });
+    }
+  }
+});
+
 after(async () => {
   await prisma.$disconnect();
 });
