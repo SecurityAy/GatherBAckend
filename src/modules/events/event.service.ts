@@ -271,9 +271,13 @@ export async function getPublicEventBySlug(slug: string, device?: DeviceContext)
       });
       hasReserved = Boolean(existingRegistration);
     } catch (error) {
-      // If the device-hash migration has not been applied yet, keep the public page
-      // working and treat the visitor as a new device instead of returning a 500.
-      console.error('Device reservation lookup failed; treating the visitor as a new device.', error);
+      // Only tolerate the device-hash columns not existing yet. Real database
+      // failures must still surface instead of silently reporting a new visitor.
+      if (!(error instanceof Prisma.PrismaClientKnownRequestError)
+        || !['P2021', 'P2022'].includes(error.code)) {
+        throw error;
+      }
+      console.error(`Device reservation columns are missing (${error.code}); treating the visitor as a new device until migration is applied.`);
     }
   }
   const { id: _eventId, ...publicFields } = event;
