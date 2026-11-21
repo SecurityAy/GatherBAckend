@@ -122,6 +122,8 @@ model RSVPRegistration {
   status                 RegistrationStatus
   relationshipToGraduate String?
   confirmationTokenHash  String?            @unique @db.Char(64)
+  deviceCookieHash       String?            @db.Char(64)
+  deviceClientHash       String?            @db.Char(64)
   approvedAt             DateTime?
   declinedAt             DateTime?
   cancelledAt            DateTime?
@@ -134,6 +136,8 @@ model RSVPRegistration {
 
   @@index([eventId, status])
   @@index([eventId, attendanceIntent])
+  @@index([eventId, deviceCookieHash])
+  @@index([eventId, deviceClientHash])
 }
 
 model NotificationOutbox {

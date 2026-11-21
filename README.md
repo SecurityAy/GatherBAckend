@@ -93,5 +93,20 @@ RSVP creation and organiser decisions write idempotent notification jobs to the 
 
 For safe local integration tests, put the disposable Neon test database URLs in ignored `.env.test.local` and run `npm run test:safe`. The runner validates both URLs point to Neon database `gather_rsvp_test`, applies migrations to that database, then runs the suite. It requires no production `.env` database fallback.
 
+## Individual attendee tickets and check-in
+
+Tickets are persisted per `Attendee`. Only attendees belonging to an `APPROVED` registration with `attendanceIntent: ATTENDING` are eligible. Approving an attending RSVP creates one ticket for its primary and additional attendees in the same transaction as the approval. Ticket issuance stores a SHA-256 hash of a cryptographically random token; raw `qrToken` values are returned only for tickets newly issued by that request.
+
+The existing `POST /api/events/:eventId/rsvps/:registrationId/approve` response keeps its `registration` object and adds a top-level `tickets` array with the same newly-issued ticket shape shown below. Rejections return an empty `tickets` array. Token-bearing approval and issuance responses use `Cache-Control: no-store`.
+
+Authenticated event-owner endpoints:
+
+- `POST /api/events/:eventId/tickets/issue` issues any missing eligible tickets for the event. It is safe to call repeatedly. Returns `200` with `{ "issuedCount": 1, "tickets": [{ "attendeeId": "...", "ticketId": "...", "qrToken": "..." }] }`. Existing tickets are not recreated and their raw tokens cannot be recovered. Keep tokens private and deliver/display them only to the intended attendee.
+- `GET /api/events/:eventId/attendees?page=1&pageSize=50` returns `{ attendees, pagination }`. Each attendee contains `id`, `firstName`, `lastName`, `attendeeType`, `attendanceIntent`, `registrationStatus`, `hasTicket`, `checkedIn`, and `checkedInAt`. QR tokens and hashes are never included. Page size is 1–100.
+
+`POST /api/tickets/checkin` requires an authenticated owner of the supplied event and JSON `{ "eventId": "<UUID>", "qrToken": "<one-time token>" }`. It atomically marks the ticket used and creates its check-in record. It returns a safe attendee summary and `checkedInAt`; unknown/wrong-event tickets return 404 and already-used/ineligible tickets return 409. For a short client transition, `qrCode` is accepted as an alias for `qrToken`, but its value must now be a server-issued token.
+
+The former in-memory `GET /api/tickets/validate/:qrCode` route now returns 410 with migration guidance. Prototype tickets held only in process memory are not migrated or recognized. Because raw tokens are intentionally not stored, a token lost after successful issuance cannot be returned by a later idempotent issuance call; a future explicit revoke-and-reissue flow is needed for recovery.
+
 ## Notes
-Authentication and event management use Prisma/PostgreSQL. RSVP submissions and organiser registration reads are also implemented on the backend, but the frontend RSVP flow is not connected yet. Ticket and check-in routes are still prototype implementations and should not be used as authoritative production workflows.
+Authentication, event management, RSVP, ticket issuance, attendee listing, and ticket check-in use Prisma/PostgreSQL. The frontend RSVP and ticket-scanning flows are not verified as connected to these APIs. Existing QR-token delivery to guests is not implemented by this backend.

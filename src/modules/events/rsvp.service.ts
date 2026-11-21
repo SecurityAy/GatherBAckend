@@ -6,6 +6,8 @@ import { HttpError } from '../../middleware/errorHandler.js';
 import { env } from '../../config/env.js';
 import { enqueueNotification, notificationPayload } from '../notifications/notification-outbox.service.js';
 import { countReservedGuestSpaces, lockEventCapacity } from './capacity.service.js';
+import { defaultDeviceContext, deviceRegistrationFilter, type DeviceContext } from './device.service.js';
+import { issueEligibleRegistrationTickets } from '../tickets/ticket.service.js';
 
 const guestNameSchema = z.string().trim().min(2).max(200).refine(
   (value) => value.split(/\s+/).length >= 2,
@@ -158,7 +160,11 @@ async function findAcceptingEvent(slug: string) {
   return event;
 }
 
-export async function submitRsvp(slug: string, input: unknown) {
+export async function submitRsvp(
+  slug: string,
+  input: unknown,
+  device: DeviceContext = defaultDeviceContext(),
+) {
   const payload: ParsedRsvp = rsvpSchema.parse(input);
   const event = await findAcceptingEvent(slug);
 
@@ -179,7 +185,7 @@ export async function submitRsvp(slug: string, input: unknown) {
   const lockKey = `${event.id}:${payload.primaryGuestEmail}`;
 
   try {
-    const registration = await prisma.$transaction(async (transaction) => {
+    const result = await prisma.$transaction(async (transaction) => {
       await lockEventCapacity(transaction, event.id);
       await transaction.$queryRaw`SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))) AS advisory_lock`;
 
@@ -205,6 +211,18 @@ export async function submitRsvp(slug: string, input: unknown) {
 
       if (!currentEvent) {
         throw new HttpError(409, 'RSVP is no longer available for this event.');
+      }
+
+      // A device may reserve an event only once, regardless of attendance intent.
+      // Checked under the event capacity lock so concurrent submissions cannot both pass.
+      if (device.lookupHashes.length > 0) {
+        const existingDeviceRegistration = await transaction.rSVPRegistration.findFirst({
+          where: deviceRegistrationFilter(event.id, device.lookupHashes),
+          select: { id: true },
+        });
+        if (existingDeviceRegistration) {
+          throw new HttpError(409, 'A reservation has already been made for this event on this device.');
+        }
       }
 
       if (
@@ -258,6 +276,8 @@ export async function submitRsvp(slug: string, input: unknown) {
           status,
           relationshipToGraduate: payload.relationshipToGraduate ?? null,
           confirmationTokenHash,
+          deviceCookieHash: device.cookieHash,
+          deviceClientHash: device.clientHash ?? null,
           attendees: {
             create: [
               {
@@ -281,6 +301,14 @@ export async function submitRsvp(slug: string, input: unknown) {
           },
         },
       });
+
+      // Auto-approved attending registrations never pass through decideEventRegistration,
+      // so issue their tickets here while the capacity lock and transaction are still held.
+      const issuedTickets = createdRegistration.status === RegistrationStatus.APPROVED &&
+        createdRegistration.attendanceIntent === AttendanceIntent.ATTENDING
+        ? await issueEligibleRegistrationTickets(transaction, createdRegistration.id, event.id)
+        : [];
+
       const guestName = `${primaryName.firstName} ${primaryName.lastName}`.trim();
       const basePayload = {
         guestName,
@@ -299,7 +327,7 @@ export async function submitRsvp(slug: string, input: unknown) {
         notificationPayload({ type: 'ORGANISER_NEW_RSVP', recipientEmail: currentEvent.user.email, ...basePayload }));
       await enqueueNotification(transaction, createdRegistration.id, NotificationType.GUEST_RSVP_RECEIVED, payload.primaryGuestEmail,
         notificationPayload({ type: 'GUEST_RSVP_RECEIVED', recipientEmail: payload.primaryGuestEmail, ...basePayload }));
-      return createdRegistration;
+      return { registration: createdRegistration, tickets: issuedTickets };
     }, {
       isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
       maxWait: 10000,
@@ -308,7 +336,7 @@ export async function submitRsvp(slug: string, input: unknown) {
 
     return {
       confirmationToken: token,
-      registration,
+      ...result,
     };
   } catch (error) {
     if (error instanceof HttpError) {
@@ -454,6 +482,10 @@ export async function decideEventRegistration(
       throw new HttpError(404, 'Registration not found.');
     }
 
+    const issuedTickets = decision === 'approve'
+      ? await issueEligibleRegistrationTickets(transaction, registration.id, eventId)
+      : [];
+
     const primary = registration.attendees[0];
     const notificationType = decision === 'approve' ? NotificationType.GUEST_RSVP_APPROVED : NotificationType.GUEST_RSVP_DECLINED;
     if (primary?.email) {
@@ -472,7 +504,7 @@ export async function decideEventRegistration(
         }));
     }
 
-    return updatedRegistration;
+    return { registration: updatedRegistration, tickets: issuedTickets };
     }, { maxWait: 10000, timeout: 30000 });
   } catch (error) {
     const diagnostic = error instanceof Prisma.PrismaClientKnownRequestError

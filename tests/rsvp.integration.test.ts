@@ -6,7 +6,7 @@ import jwt from 'jsonwebtoken';
 import { ZodError } from 'zod';
 import { env, readResendConfiguration } from '../src/config/env.js';
 import { prisma } from '../src/lib/prisma.js';
-import app from '../src/app.js';
+import app, { redactTicketUrl, setRequestLogStreamForTests } from '../src/app.js';
 import { decideEventRegistration, getRsvpConfirmation, submitRsvp } from '../src/modules/events/rsvp.service.js';
 import { notificationRetryDelay, runNotificationWorkerOnce, setNotificationSenderForTests } from '../src/modules/notifications/notification-outbox.service.js';
 import { renderNotificationEmail } from '../src/modules/notifications/email-templates.js';
@@ -34,6 +34,18 @@ async function request(path: string, init?: RequestInit) {
   const address = server.address();
   assert.ok(address && typeof address !== 'string');
   return fetch(`http://127.0.0.1:${address.port}${path}`, init);
+}
+
+function createLogCapture() {
+  const messages: string[] = [];
+  return {
+    stream: { write: (message: string) => { messages.push(message); } },
+    text: () => messages.join(''),
+  };
+}
+
+function waitForLogFlush() {
+  return new Promise<void>((resolve) => setImmediate(resolve));
 }
 
 function rsvpBody(email: string, overrides: Record<string, unknown> = {}) {
@@ -669,6 +681,10 @@ test('event guest capacity accounts for reserved attendee rows and serializes su
       if (server === capacityServer) server = undefined;
     }
     if (eventIds.length) {
+      await prisma.attendanceCheckIn.deleteMany({
+        where: { ticket: { attendee: { registration: { eventId: { in: eventIds } } } } },
+      });
+      await prisma.ticket.deleteMany({ where: { attendee: { registration: { eventId: { in: eventIds } } } } });
       await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: eventIds } } } });
       await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: eventIds } } });
       await prisma.event.deleteMany({ where: { id: { in: eventIds } } });
@@ -725,8 +741,8 @@ test('organiser RSVP decisions enforce ownership, pending state, and atomic tran
     });
     testEventIds.push(otherEvent.id);
 
-    async function createPendingRegistration(slug: string, emailSuffix: string) {
-      const submission = await submitRsvp(slug, rsvpBody(`rsvp-decision-${suffix}-${emailSuffix}@example.test`));
+    async function createPendingRegistration(slug: string, emailSuffix: string, additionalGuestNames: string[] = []) {
+      const submission = await submitRsvp(slug, rsvpBody(`rsvp-decision-${suffix}-${emailSuffix}@example.test`, { additionalGuestNames }));
       const tokenHash = createHash('sha256').update(submission.confirmationToken).digest('hex');
       const registration = await prisma.rSVPRegistration.findUniqueOrThrow({
         where: { confirmationTokenHash: tokenHash },
@@ -752,7 +768,7 @@ test('organiser RSVP decisions enforce ownership, pending state, and atomic tran
       return { id: registration.id, tokenHash };
     }
 
-    const approval = await createPendingRegistration(event.slug, 'approve');
+    const approval = await createPendingRegistration(event.slug, 'approve', ['Additional One', 'Additional Two']);
     const rejection = await createPendingRegistration(event.slug, 'reject');
     const concurrent = await createPendingRegistration(event.slug, 'concurrent');
     const foreign = await createPendingRegistration(otherEvent.slug, 'foreign');
@@ -769,7 +785,13 @@ test('organiser RSVP decisions enforce ownership, pending state, and atomic tran
     assert.equal(await prisma.attendee.count({ where: { registrationId: notAttendingRegistration.id, attendeeType: AttendeeType.ADDITIONAL, email: { not: null } } }), 0);
 
     const cancelled = await prisma.rSVPRegistration.create({
-      data: { eventId: event.id, attendanceIntent: AttendanceIntent.ATTENDING, status: RegistrationStatus.CANCELLED, cancelledAt: new Date() },
+      data: {
+        eventId: event.id,
+        attendanceIntent: AttendanceIntent.ATTENDING,
+        status: RegistrationStatus.CANCELLED,
+        cancelledAt: new Date(),
+        attendees: { create: [{ firstName: 'Cancelled', lastName: 'Guest', attendeeType: AttendeeType.PRIMARY, email: `cancelled-${suffix}@example.test` }] },
+      },
       select: { id: true },
     });
 
@@ -783,6 +805,19 @@ test('organiser RSVP decisions enforce ownership, pending state, and atomic tran
     const otherOwnerHeaders = { Authorization: `Bearer ${accessToken(otherOwner.id)}` };
     const basePath = `/api/events/${event.id}/rsvps`;
 
+    const pendingIssue = await request(`/api/events/${event.id}/tickets/issue`, { method: 'POST', headers: ownerHeaders });
+    assert.equal(pendingIssue.status, 200);
+    assert.deepEqual(await pendingIssue.json(), { tickets: [], issuedCount: 0 });
+    assert.equal(await prisma.ticket.count({ where: { attendee: { registrationId: approval.id } } }), 0);
+    const unauthorizedIssue = await request(`/api/events/${event.id}/tickets/issue`, { method: 'POST' });
+    assert.equal(unauthorizedIssue.status, 401);
+    const foreignIssue = await request(`/api/events/${event.id}/tickets/issue`, { method: 'POST', headers: otherOwnerHeaders });
+    assert.equal(foreignIssue.status, 404);
+    const unauthorizedAttendees = await request(`/api/events/${event.id}/attendees`);
+    assert.equal(unauthorizedAttendees.status, 401);
+    const foreignAttendees = await request(`/api/events/${event.id}/attendees`, { headers: otherOwnerHeaders });
+    assert.equal(foreignAttendees.status, 404);
+
     const unauthenticated = await request(`${basePath}/${approval.id}/approve`, { method: 'POST' });
     assert.equal(unauthenticated.status, 401);
 
@@ -791,6 +826,7 @@ test('organiser RSVP decisions enforce ownership, pending state, and atomic tran
       headers: ownerHeaders,
     });
     assert.equal(ownerApproval.status, 200);
+    assert.equal(ownerApproval.headers.get('cache-control'), 'no-store');
     const approvedBody = await ownerApproval.json() as {
       registration: {
         id: string;
@@ -802,6 +838,7 @@ test('organiser RSVP decisions enforce ownership, pending state, and atomic tran
         declinedAt: string | null;
         attendees: Array<{ email: string | null; phone: string | null }>;
       };
+      tickets: Array<{ attendeeId: string; ticketId: string; qrToken: string }>;
     };
     assert.equal(approvedBody.registration.id, approval.id);
     assert.equal(approvedBody.registration.attendanceIntent, AttendanceIntent.ATTENDING);
@@ -809,7 +846,15 @@ test('organiser RSVP decisions enforce ownership, pending state, and atomic tran
     assert.ok(approvedBody.registration.approvedAt);
     assert.equal(approvedBody.registration.declinedAt, null);
     assert.ok(approvedBody.registration.createdAt);
-    assert.equal(approvedBody.registration.attendees.length, 1);
+    assert.equal(approvedBody.registration.attendees.length, 3);
+    assert.equal(approvedBody.tickets.length, 3);
+    assert.equal(new Set(approvedBody.tickets.map(({ attendeeId }) => attendeeId)).size, 3);
+    assert.equal(new Set(approvedBody.tickets.map(({ qrToken }) => qrToken)).size, 3);
+    for (const issuedTicket of approvedBody.tickets) {
+      assert.equal(issuedTicket.qrToken.length, 43);
+      assert.equal(await prisma.ticket.count({ where: { attendeeId: issuedTicket.attendeeId, qrTokenHash: createHash('sha256').update(issuedTicket.qrToken).digest('hex') } }), 1);
+    }
+    assert.equal(await prisma.ticket.count({ where: { attendee: { registrationId: approval.id } } }), 3);
     const approvedJson = JSON.stringify(approvedBody);
     assert.ok(!approvedJson.includes(approval.tokenHash));
     assert.doesNotMatch(approvedJson, /confirmationToken|passwordHash/);
@@ -818,6 +863,49 @@ test('organiser RSVP decisions enforce ownership, pending state, and atomic tran
     });
     assert.equal(approvalNotice?.recipientEmail, `rsvp-decision-${suffix}-approve@example.test`);
     assert.equal(approvalNotice?.status, 'PENDING');
+
+    const repeatedIssue = await request(`/api/events/${event.id}/tickets/issue`, { method: 'POST', headers: ownerHeaders });
+    assert.equal(repeatedIssue.status, 200);
+    assert.equal(repeatedIssue.headers.get('cache-control'), 'no-store');
+    assert.deepEqual(await repeatedIssue.json(), { tickets: [], issuedCount: 0 });
+    assert.equal(await prisma.ticket.count({ where: { attendee: { registrationId: approval.id } } }), 3);
+    const attendeeListResponse = await request(`/api/events/${event.id}/attendees`, { headers: ownerHeaders });
+    assert.equal(attendeeListResponse.status, 200);
+    const attendeeListJson = await attendeeListResponse.json() as { attendees: Array<{
+      id: string; attendeeType: AttendeeType; attendanceIntent: AttendanceIntent; registrationStatus: RegistrationStatus;
+      hasTicket: boolean; checkedIn: boolean; checkedInAt: string | null;
+    }> };
+    const approvalAttendeeIds = new Set(approvedBody.tickets.map(({ attendeeId }) => attendeeId));
+    const listedApprovalAttendees = attendeeListJson.attendees.filter(({ id }) => approvalAttendeeIds.has(id));
+    assert.equal(listedApprovalAttendees.length, 3);
+    assert.ok(listedApprovalAttendees.every((attendee) => attendee.registrationStatus === RegistrationStatus.APPROVED && attendee.attendanceIntent === AttendanceIntent.ATTENDING && attendee.hasTicket && !attendee.checkedIn && attendee.checkedInAt === null));
+    assert.doesNotMatch(JSON.stringify(attendeeListJson), /qrToken|qrTokenHash|ownerId/);
+
+    const firstQrToken = approvedBody.tickets[0].qrToken;
+    const checkIn = await request('/api/tickets/checkin', {
+      method: 'POST', headers: { ...ownerHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ eventId: event.id, qrToken: firstQrToken }),
+    });
+    assert.equal(checkIn.status, 200);
+    assert.doesNotMatch(await checkIn.clone().text(), /qrToken|qrTokenHash|ownerId/);
+    const checkedInListResponse = await request(`/api/events/${event.id}/attendees`, { headers: ownerHeaders });
+    const checkedInList = await checkedInListResponse.json() as { attendees: Array<{ id: string; checkedIn: boolean; checkedInAt: string | null }> };
+    const checkedInAttendee = checkedInList.attendees.find(({ id }) => id === approvedBody.tickets[0].attendeeId);
+    assert.equal(checkedInAttendee?.checkedIn, true);
+    assert.ok(checkedInAttendee?.checkedInAt);
+    const repeatedCheckIn = await request('/api/tickets/checkin', {
+      method: 'POST', headers: { ...ownerHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ eventId: event.id, qrToken: firstQrToken }),
+    });
+    assert.equal(repeatedCheckIn.status, 409);
+    const foreignCheckIn = await request('/api/tickets/checkin', {
+      method: 'POST', headers: { ...otherOwnerHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ eventId: event.id, qrToken: approvedBody.tickets[1].qrToken }),
+    });
+    assert.equal(foreignCheckIn.status, 404);
+    const retiredValidation = await request(`/api/tickets/validate/${firstQrToken}`, { headers: ownerHeaders });
+    assert.equal(retiredValidation.status, 410);
+    assert.doesNotMatch(await retiredValidation.text(), new RegExp(firstQrToken));
 
     const ownerRejection = await request(`${basePath}/${rejection.id}/reject`, {
       method: 'POST',
@@ -835,6 +923,50 @@ test('organiser RSVP decisions enforce ownership, pending state, and atomic tran
       where: { registrationId_type: { registrationId: rejection.id, type: 'GUEST_RSVP_DECLINED' } },
     });
     assert.equal(declineNotice?.recipientEmail, `rsvp-decision-${suffix}-reject@example.test`);
+    assert.equal(await prisma.ticket.count({ where: { attendee: { registrationId: rejection.id } } }), 0);
+    assert.equal(await prisma.ticket.count({ where: { attendee: { registrationId: cancelled.id } } }), 0);
+    assert.equal(await prisma.ticket.count({ where: { attendee: { registrationId: notAttendingRegistration.id } } }), 0);
+
+    const concurrentIssuance = await prisma.rSVPRegistration.create({
+      data: {
+        eventId: event.id,
+        attendanceIntent: AttendanceIntent.ATTENDING,
+        status: RegistrationStatus.APPROVED,
+        approvedAt: new Date(),
+        attendees: { create: [
+          { firstName: 'Concurrent', lastName: 'Primary', email: `concurrent-approved-${suffix}@example.test`, attendeeType: AttendeeType.PRIMARY },
+          { firstName: 'Concurrent', lastName: 'Additional One', attendeeType: AttendeeType.ADDITIONAL },
+          { firstName: 'Concurrent', lastName: 'Additional Two', attendeeType: AttendeeType.ADDITIONAL },
+        ] },
+      },
+      select: { id: true },
+    });
+    const [issuanceOne, issuanceTwo] = await Promise.all([
+      request(`/api/events/${event.id}/tickets/issue`, { method: 'POST', headers: ownerHeaders }),
+      request(`/api/events/${event.id}/tickets/issue`, { method: 'POST', headers: ownerHeaders }),
+    ]);
+    assert.equal(issuanceOne.status, 200);
+    assert.equal(issuanceTwo.status, 200);
+    const issuanceOneJson = await issuanceOne.json() as { issuedCount: number; tickets: Array<{ qrToken: string }> };
+    const issuanceTwoJson = await issuanceTwo.json() as { issuedCount: number; tickets: Array<{ qrToken: string }> };
+    assert.equal(issuanceOneJson.issuedCount + issuanceTwoJson.issuedCount, 3);
+    assert.equal(await prisma.ticket.count({ where: { attendee: { registrationId: concurrentIssuance.id } } }), 3);
+    assert.equal(new Set([...issuanceOneJson.tickets, ...issuanceTwoJson.tickets].map(({ qrToken }) => qrToken)).size, 3);
+
+    const approvalIssuanceRace = await createPendingRegistration(event.slug, 'approval-issuance-race', ['Race Guest One', 'Race Guest Two']);
+    const [raceApprovalResponse, raceIssuanceResponse] = await Promise.all([
+      request(`${basePath}/${approvalIssuanceRace.id}/approve`, { method: 'POST', headers: ownerHeaders }),
+      request(`/api/events/${event.id}/tickets/issue`, { method: 'POST', headers: ownerHeaders }),
+    ]);
+    assert.equal(raceApprovalResponse.status, 200);
+    assert.equal(raceIssuanceResponse.status, 200);
+    const raceApprovalJson = await raceApprovalResponse.json() as { tickets: Array<{ attendeeId: string; qrToken: string }> };
+    const raceIssuanceJson = await raceIssuanceResponse.json() as { tickets: Array<{ attendeeId: string; qrToken: string }> };
+    const raceAttendees = await prisma.attendee.findMany({ where: { registrationId: approvalIssuanceRace.id }, select: { id: true } });
+    assert.equal(raceAttendees.length, 3);
+    assert.equal(await prisma.ticket.count({ where: { attendee: { registrationId: approvalIssuanceRace.id } } }), 3);
+    assert.equal(raceApprovalJson.tickets.length + raceIssuanceJson.tickets.filter((ticket) => raceAttendees.some(({ id }) => id === ticket.attendeeId)).length, 3);
+    assert.equal(new Set([...raceApprovalJson.tickets, ...raceIssuanceJson.tickets.filter((ticket) => raceAttendees.some(({ id }) => id === ticket.attendeeId))].map(({ qrToken }) => qrToken)).size, 3);
 
     const foreignApproval = await request(`/api/events/${otherEvent.id}/rsvps/${foreign.id}/approve`, {
       method: 'POST',
@@ -1145,6 +1277,8 @@ test('Resend configuration gaps preserve RSVP flows and acknowledgements render 
     const staleFixtures = await prisma.event.findMany({ where: { slug: { startsWith: 'email-status-' } }, select: { id: true } });
     if (staleFixtures.length) {
       const staleIds = staleFixtures.map(({ id }) => id);
+      await prisma.attendanceCheckIn.deleteMany({ where: { ticket: { attendee: { registration: { eventId: { in: staleIds } } } } } });
+      await prisma.ticket.deleteMany({ where: { attendee: { registration: { eventId: { in: staleIds } } } } });
       await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: staleIds } } } });
       await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: staleIds } } });
       await prisma.event.deleteMany({ where: { id: { in: staleIds } } });
@@ -1224,11 +1358,414 @@ test('Resend configuration gaps preserve RSVP flows and acknowledgements render 
     env.resend = originalResend;
     env.frontendUrl = originalFrontendUrl;
     if (eventId) {
+      await prisma.attendanceCheckIn.deleteMany({ where: { ticket: { attendee: { registration: { eventId } } } } });
+      await prisma.ticket.deleteMany({ where: { attendee: { registration: { eventId } } } });
       await prisma.attendee.deleteMany({ where: { registration: { eventId } } });
       await prisma.rSVPRegistration.deleteMany({ where: { eventId } });
       await prisma.event.deleteMany({ where: { id: eventId } });
     }
     if (ownerId) await prisma.user.deleteMany({ where: { id: ownerId } });
+  }
+});
+
+test('auto-approved RSVPs issue usable tickets and ticket URLs are redacted before logging', async () => {
+  const suffix = randomUUID();
+  const userIds: string[] = [];
+  const eventIds: string[] = [];
+  let localServer: ReturnType<typeof app.listen> | undefined;
+  const logCapture = createLogCapture();
+
+  try {
+    const owner = await prisma.user.create({
+      data: {
+        firstName: 'Auto',
+        lastName: 'Ticketing Owner',
+        email: `auto-ticketing-${suffix}@example.test`,
+        passwordHash: 'test-only-hash',
+      },
+    });
+    userIds.push(owner.id);
+
+    const event = await prisma.event.create({
+      data: {
+        userId: owner.id,
+        title: 'Auto Approved Ticketing Event',
+        slug: `auto-ticketing-${suffix}`,
+        eventCategory: 'Test',
+        eventStatus: EventStatus.PUBLISHED,
+        approvalRequired: false,
+        additionalGuestLimit: 2,
+      },
+    });
+    eventIds.push(event.id);
+
+    localServer = app.listen(0);
+    server = localServer;
+    await new Promise<void>((resolve, reject) => {
+      localServer!.once('listening', resolve);
+      localServer!.once('error', reject);
+    });
+
+    setRequestLogStreamForTests(logCapture.stream);
+    const ownerHeaders = { Authorization: `Bearer ${accessToken(owner.id)}` };
+
+    const submissionResponse = await request(`/api/events/public/${event.slug}/rsvp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Forwarded-For': '192.0.2.10',
+      },
+      body: JSON.stringify(rsvpBody(`auto-ticketing-primary-${suffix}@example.test`, {
+        additionalGuestNames: ['Auto Additional One', 'Auto Additional Two'],
+      })),
+    });
+    assert.equal(submissionResponse.status, 201);
+    assert.equal(submissionResponse.headers.get('cache-control'), 'no-store');
+
+    const submissionText = await submissionResponse.text();
+    const submission = JSON.parse(submissionText) as {
+      confirmationToken: string;
+      registration: {
+        status: RegistrationStatus;
+        attendanceIntent: AttendanceIntent;
+        attendees: Array<{ attendeeType: AttendeeType }>;
+      };
+      tickets: Array<{ attendeeId: string; ticketId: string; qrToken: string }>;
+    };
+
+    assert.equal(submission.registration.status, RegistrationStatus.APPROVED);
+    assert.equal(submission.registration.attendanceIntent, AttendanceIntent.ATTENDING);
+    assert.equal(submission.registration.attendees.length, 3);
+    assert.equal(submission.registration.attendees.filter(({ attendeeType }) => attendeeType === AttendeeType.PRIMARY).length, 1);
+    assert.equal(submission.registration.attendees.filter(({ attendeeType }) => attendeeType === AttendeeType.ADDITIONAL).length, 2);
+
+    assert.equal(submission.tickets.length, 3, 'every attending guest must receive a ticket');
+    assert.equal(new Set(submission.tickets.map(({ attendeeId }) => attendeeId)).size, 3);
+    assert.equal(new Set(submission.tickets.map(({ ticketId }) => ticketId)).size, 3);
+    assert.equal(new Set(submission.tickets.map(({ qrToken }) => qrToken)).size, 3);
+    for (const ticket of submission.tickets) {
+      assert.match(ticket.qrToken, /^[A-Za-z0-9_-]{43}$/);
+    }
+    assert.ok(!submissionText.includes('qrTokenHash'));
+    assert.ok(!submissionText.includes('confirmationTokenHash'));
+    assert.ok(!submissionText.includes('passwordHash'));
+
+    const tokenHash = createHash('sha256').update(submission.confirmationToken).digest('hex');
+    const registration = await prisma.rSVPRegistration.findUniqueOrThrow({
+      where: { confirmationTokenHash: tokenHash },
+      select: { id: true, status: true, attendanceIntent: true },
+    });
+    assert.equal(registration.status, RegistrationStatus.APPROVED);
+    assert.equal(registration.attendanceIntent, AttendanceIntent.ATTENDING);
+
+    const attendeeIds = await prisma.attendee.findMany({
+      where: { registrationId: registration.id },
+      select: { id: true },
+    });
+    assert.deepEqual(
+      new Set(submission.tickets.map(({ attendeeId }) => attendeeId)),
+      new Set(attendeeIds.map(({ id }) => id)),
+    );
+
+    const storedTickets = await prisma.ticket.findMany({
+      where: { attendee: { registrationId: registration.id } },
+      select: { id: true, attendeeId: true, qrTokenHash: true },
+    });
+    assert.equal(storedTickets.length, 3);
+    for (const ticket of submission.tickets) {
+      const stored = storedTickets.find(({ id }) => id === ticket.ticketId);
+      assert.ok(stored, 'each returned ticket must be persisted');
+      assert.equal(stored.attendeeId, ticket.attendeeId);
+      assert.equal(stored.qrTokenHash, createHash('sha256').update(ticket.qrToken).digest('hex'));
+    }
+    assert.ok(storedTickets.every(({ qrTokenHash }) =>
+      !submission.tickets.some(({ qrToken }) => qrToken === qrTokenHash)), 'only token hashes may be stored');
+
+    const repeatedIssue = await request(`/api/events/${event.id}/tickets/issue`, {
+      method: 'POST',
+      headers: ownerHeaders,
+    });
+    assert.equal(repeatedIssue.status, 200);
+    assert.deepEqual(await repeatedIssue.json(), { tickets: [], issuedCount: 0 });
+    assert.equal(await prisma.ticket.count({ where: { attendee: { registrationId: registration.id } } }), 3);
+
+    for (const ticket of submission.tickets) {
+      const checkIn = await request('/api/tickets/checkin', {
+        method: 'POST',
+        headers: { ...ownerHeaders, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ eventId: event.id, qrToken: ticket.qrToken }),
+      });
+      assert.equal(checkIn.status, 200);
+      const checkInText = await checkIn.text();
+      assert.ok(!checkInText.includes(ticket.qrToken), 'check-in responses must not echo QR tokens');
+      assert.ok(!checkInText.includes('qrTokenHash'));
+    }
+    assert.equal(await prisma.attendanceCheckIn.count({
+      where: { ticket: { attendee: { registrationId: registration.id } } },
+    }), 3);
+
+    const notAttending = await submitRsvp(event.slug, rsvpBody(`auto-ticketing-no-${suffix}@example.test`, {
+      attendanceIntent: AttendanceIntent.NOT_ATTENDING,
+    }));
+    assert.equal(notAttending.registration.status, RegistrationStatus.NOT_REQUIRED);
+    assert.deepEqual(notAttending.tickets, []);
+    const notAttendingId = (await prisma.rSVPRegistration.findUniqueOrThrow({
+      where: { confirmationTokenHash: createHash('sha256').update(notAttending.confirmationToken).digest('hex') },
+      select: { id: true },
+    })).id;
+    assert.equal(await prisma.ticket.count({ where: { attendee: { registrationId: notAttendingId } } }), 0);
+
+    const retiredToken = submission.tickets[0].qrToken;
+    assert.equal(
+      redactTicketUrl(`/api/tickets/validate/${retiredToken}`),
+      '/api/tickets/validate/[redacted]',
+    );
+    assert.equal(
+      redactTicketUrl(`/api/tickets/checkin?qrToken=${retiredToken}&page=2`),
+      '/api/tickets/checkin?qrToken=[redacted]&page=2',
+    );
+
+    const retiredGet = await request(`/api/tickets/validate/${retiredToken}`, { headers: ownerHeaders });
+    assert.equal(retiredGet.status, 410);
+    const retiredGetText = await retiredGet.text();
+    assert.ok(!retiredGetText.includes(retiredToken), '410 response must not echo the QR token');
+
+    const retiredPost = await request(`/api/tickets/validate/${retiredToken}`, {
+      method: 'POST',
+      headers: ownerHeaders,
+    });
+    assert.equal(retiredPost.status, 404);
+    const retiredPostText = await retiredPost.text();
+    assert.deepEqual(JSON.parse(retiredPostText), { message: 'Route not found.' });
+    assert.ok(!retiredPostText.includes(retiredToken), '404 response must not echo the QR token');
+
+    const queryTokenRequest = await request(`/api/tickets/checkin?qrToken=${retiredToken}`, {
+      method: 'POST',
+      headers: ownerHeaders,
+    });
+    assert.equal(queryTokenRequest.status, 400);
+    const queryTokenText = await queryTokenRequest.text();
+    assert.ok(!queryTokenText.includes(retiredToken), 'validation errors must not echo the QR token');
+
+    await waitForLogFlush();
+    const capturedLogs = logCapture.text();
+    assert.match(capturedLogs, /\[redacted\]/);
+    for (const ticket of submission.tickets) {
+      assert.ok(!capturedLogs.includes(ticket.qrToken), 'request logs must not contain QR tokens');
+    }
+  } finally {
+    setRequestLogStreamForTests(undefined);
+    if (localServer) {
+      await new Promise<void>((resolve, reject) => localServer!.close((error) => error ? reject(error) : resolve()));
+      if (server === localServer) server = undefined;
+    }
+    if (eventIds.length) {
+      await prisma.attendanceCheckIn.deleteMany({
+        where: { ticket: { attendee: { registration: { eventId: { in: eventIds } } } } },
+      });
+      await prisma.ticket.deleteMany({ where: { attendee: { registration: { eventId: { in: eventIds } } } } });
+      await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: eventIds } } } });
+      await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.event.deleteMany({ where: { id: { in: eventIds } } });
+    }
+    if (userIds.length) {
+      await prisma.user.deleteMany({ where: { id: { in: userIds } } });
+    }
+  }
+});
+
+test('device-scoped RSVP reservations block repeats and hide the save-me-a-seat CTA', async () => {
+  const suffix = randomUUID();
+  const userIds: string[] = [];
+  const eventIds: string[] = [];
+  let localServer: ReturnType<typeof app.listen> | undefined;
+  let addressIndex = 0;
+  const nextIp = () => `198.18.${Math.floor(addressIndex / 250)}.${(addressIndex++ % 250) + 1}`;
+
+  try {
+    const owner = await prisma.user.create({
+      data: {
+        firstName: 'Device',
+        lastName: 'Owner',
+        email: `device-rsvp-${suffix}-owner@example.test`,
+        passwordHash: 'test-only-hash',
+      },
+    });
+    userIds.push(owner.id);
+
+    const event = await prisma.event.create({
+      data: {
+        userId: owner.id,
+        title: 'Device Scoped RSVP Event',
+        slug: `device-rsvp-${suffix}`,
+        eventCategory: 'Test',
+        eventStatus: EventStatus.PUBLISHED,
+        approvalRequired: false,
+      },
+    });
+    eventIds.push(event.id);
+    const otherEvent = await prisma.event.create({
+      data: {
+        userId: owner.id,
+        title: 'Other Device Scoped RSVP Event',
+        slug: `device-rsvp-other-${suffix}`,
+        eventCategory: 'Test',
+        eventStatus: EventStatus.PUBLISHED,
+        approvalRequired: false,
+      },
+    });
+    eventIds.push(otherEvent.id);
+
+    localServer = app.listen(0);
+    server = localServer;
+    await new Promise<void>((resolve, reject) => {
+      localServer!.once('listening', resolve);
+      localServer!.once('error', reject);
+    });
+
+    const clientA = `device-a-${suffix}`;
+    const clientB = `device-b-${suffix}`;
+    const clientC = `device-c-${suffix}`;
+    const publicUrl = `/api/events/public/${event.slug}`;
+    const rsvpUrl = `${publicUrl}/rsvp`;
+
+    const preflight = await request(publicUrl, { headers: { 'X-Forwarded-For': nextIp() } });
+    assert.equal(preflight.status, 200);
+    assert.equal(((await preflight.json()) as { event: { hasReserved: boolean } }).event.hasReserved, false);
+
+    const first = await request(rsvpUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Device-Id': clientA,
+        'X-Forwarded-For': nextIp(),
+      },
+      body: JSON.stringify(rsvpBody(`device-rsvp-a-${suffix}@example.test`)),
+    });
+    assert.equal(first.status, 201);
+    const setCookie = first.headers.get('set-cookie');
+    assert.ok(setCookie);
+    assert.match(setCookie, /^gather_device=/);
+    assert.match(setCookie, /HttpOnly/i);
+    const cookie = setCookie.split(';')[0];
+
+    const repeatClient = await request(rsvpUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Device-Id': clientA,
+        'X-Forwarded-For': nextIp(),
+      },
+      body: JSON.stringify(rsvpBody(`device-rsvp-a-repeat-${suffix}@example.test`)),
+    });
+    assert.equal(repeatClient.status, 409);
+    assert.match((await repeatClient.json() as { message: string }).message, /already been made.*this device/i);
+
+    const repeatCookie = await request(rsvpUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookie,
+        'X-Forwarded-For': nextIp(),
+      },
+      body: JSON.stringify(rsvpBody(`device-rsvp-a-cookie-${suffix}@example.test`)),
+    });
+    assert.equal(repeatCookie.status, 409);
+
+    const afterReservation = await request(publicUrl, {
+      headers: { Cookie: cookie, 'X-Forwarded-For': nextIp() },
+    });
+    assert.equal(((await afterReservation.json()) as { event: { hasReserved: boolean } }).event.hasReserved, true);
+
+    const freshVisitor = await request(publicUrl, {
+      headers: { 'X-Device-Id': clientB, 'X-Forwarded-For': nextIp() },
+    });
+    assert.equal(((await freshVisitor.json()) as { event: { hasReserved: boolean } }).event.hasReserved, false);
+
+    const secondDevice = await request(rsvpUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Device-Id': clientB,
+        'X-Forwarded-For': nextIp(),
+      },
+      body: JSON.stringify(rsvpBody(`device-rsvp-b-${suffix}@example.test`)),
+    });
+    assert.equal(secondDevice.status, 201);
+
+    const otherEventSubmission = await request(`/api/events/public/${otherEvent.slug}/rsvp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Device-Id': clientA,
+        'X-Forwarded-For': nextIp(),
+      },
+      body: JSON.stringify(rsvpBody(`device-rsvp-a-other-${suffix}@example.test`)),
+    });
+    assert.equal(otherEventSubmission.status, 201, 'the rule is scoped per event');
+
+    const notAttending = await request(rsvpUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Device-Id': clientC,
+        'X-Forwarded-For': nextIp(),
+      },
+      body: JSON.stringify(rsvpBody(`device-rsvp-c-${suffix}@example.test`, {
+        attendanceIntent: AttendanceIntent.NOT_ATTENDING,
+      })),
+    });
+    assert.equal(notAttending.status, 201);
+    const afterNotAttending = await request(rsvpUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Device-Id': clientC,
+        'X-Forwarded-For': nextIp(),
+      },
+      body: JSON.stringify(rsvpBody(`device-rsvp-c-repeat-${suffix}@example.test`)),
+    });
+    assert.equal(afterNotAttending.status, 409, 'NOT_ATTENDING also reserves the device for the event');
+
+    const tamperedCookie = await request(rsvpUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: 'gather_device=tampered',
+        'X-Device-Id': clientA,
+        'X-Forwarded-For': nextIp(),
+      },
+      body: JSON.stringify(rsvpBody(`device-rsvp-a-tampered-${suffix}@example.test`)),
+    });
+    assert.equal(tamperedCookie.status, 409, 'an invalid cookie must fall back to the client ID');
+
+    const stored = await prisma.rSVPRegistration.findMany({
+      where: { eventId: { in: [event.id, otherEvent.id] } },
+      select: { deviceCookieHash: true, deviceClientHash: true },
+    });
+    assert.ok(stored.length > 0);
+    for (const registration of stored) {
+      assert.match(registration.deviceCookieHash ?? '', /^[a-f0-9]{64}$/);
+      assert.ok(!registration.deviceClientHash || /^[a-f0-9]{64}$/.test(registration.deviceClientHash));
+    }
+    assert.ok(!JSON.stringify(stored).includes(clientA), 'raw device IDs must not be persisted');
+  } finally {
+    if (localServer) {
+      await new Promise<void>((resolve, reject) => localServer!.close((error) => error ? reject(error) : resolve()));
+      if (server === localServer) server = undefined;
+    }
+    if (eventIds.length) {
+      await prisma.attendanceCheckIn.deleteMany({
+        where: { ticket: { attendee: { registration: { eventId: { in: eventIds } } } } },
+      });
+      await prisma.ticket.deleteMany({ where: { attendee: { registration: { eventId: { in: eventIds } } } } });
+      await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: eventIds } } } });
+      await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.event.deleteMany({ where: { id: { in: eventIds } } });
+    }
+    if (userIds.length) {
+      await prisma.user.deleteMany({ where: { id: { in: userIds } } });
+    }
   }
 });
 

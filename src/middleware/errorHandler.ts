@@ -12,8 +12,9 @@ export class HttpError extends Error {
   }
 }
 
-export function notFoundHandler(req: Request, res: Response) {
-  res.status(404).json({ message: `Route not found: ${req.originalUrl}` });
+export function notFoundHandler(_req: Request, res: Response) {
+  // Never reflect the request URL: it may contain QR tokens or other bearer credentials.
+  res.status(404).json({ message: 'Route not found.' });
 }
 
 export function errorHandler(error: Error, _req: Request, res: Response, _next: NextFunction) {

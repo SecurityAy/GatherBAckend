@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { capacitySummary, countReservedGuestSpaces, lockEventCapacity } from './capacity.service.js';
+import { deviceRegistrationFilter, type DeviceContext } from './device.service.js';
 
 const optionalText = (max: number) => z.string().trim().max(max).nullable().optional();
 const optionalUrl = z.string().url().max(2048).nullable().optional();
@@ -250,7 +251,7 @@ export async function getEventById(id: string, userId: string) {
   };
 }
 
-export async function getPublicEventBySlug(slug: string) {
+export async function getPublicEventBySlug(slug: string, device?: DeviceContext) {
   const event = await prisma.event.findFirst({
     where: { slug, eventStatus: EventStatus.PUBLISHED, deletedAt: null },
     select: { ...publicEventSelect, id: true },
@@ -261,8 +262,20 @@ export async function getPublicEventBySlug(slug: string) {
   }
 
   const reservedGuestCount = await countReservedGuestSpaces(prisma, event.id);
+  let hasReserved = false;
+  if (device && device.lookupHashes.length > 0) {
+    const existingRegistration = await prisma.rSVPRegistration.findFirst({
+      where: deviceRegistrationFilter(event.id, device.lookupHashes),
+      select: { id: true },
+    });
+    hasReserved = Boolean(existingRegistration);
+  }
   const { id: _eventId, ...publicFields } = event;
-  return { ...publicFields, ...capacitySummary(event.maxGuestCapacity, reservedGuestCount) };
+  return {
+    ...publicFields,
+    ...capacitySummary(event.maxGuestCapacity, reservedGuestCount),
+    hasReserved,
+  };
 }
 
 export async function updateEvent(id: string, userId: string, input: unknown) {

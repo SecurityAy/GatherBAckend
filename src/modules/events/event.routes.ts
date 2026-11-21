@@ -1,6 +1,7 @@
 import { Router, type NextFunction, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { requireAuth } from '../../middleware/auth.js';
+import { resolveDeviceContext, setDeviceCookie } from './device.service.js';
 import { createEventImageUploadSignature } from './image-upload.service.js';
 import {
   createEvent,
@@ -20,6 +21,7 @@ import {
   parseRegistrationPagination,
   submitRsvp,
 } from './rsvp.service.js';
+import { issueMissingEventTickets, listEventAttendees } from '../tickets/ticket.service.js';
 
 const eventRouter = Router();
 
@@ -64,10 +66,16 @@ const paginationSchema = z.object({
 
 const decisionBodySchema = z.object({}).strict();
 const imageUploadSignatureBodySchema = z.object({}).strict();
+const attendeePaginationSchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(50),
+}).strict();
 
 eventRouter.get('/public/:slug', async (req: Request<{ slug: string }>, res, next) => {
   try {
-    const event = await getPublicEventBySlug(req.params.slug);
+    const event = await getPublicEventBySlug(req.params.slug, resolveDeviceContext(req));
+    // hasReserved is device-specific, so this response must never be cached for another visitor.
+    res.setHeader('Cache-Control', 'no-store');
     res.status(200).json({ event });
   } catch (error) {
     next(error);
@@ -76,7 +84,11 @@ eventRouter.get('/public/:slug', async (req: Request<{ slug: string }>, res, nex
 
 eventRouter.post('/public/:slug/rsvp', limitRsvpSubmission, async (req: Request<{ slug: string }>, res, next) => {
   try {
-    const result = await submitRsvp(req.params.slug, req.body);
+    const device = resolveDeviceContext(req);
+    setDeviceCookie(res, device.deviceId);
+    const result = await submitRsvp(req.params.slug, req.body, device);
+    // This response carries a confirmation token and, for auto-approved events, QR tokens.
+    res.setHeader('Cache-Control', 'no-store');
     res.status(201).json(result);
   } catch (error) {
     next(error);
@@ -171,13 +183,14 @@ const decideRsvp = (decision: 'approve' | 'reject') => async (
 ) => {
   try {
     decisionBodySchema.parse(req.body ?? {});
-    const registration = await decideEventRegistration(
+    const result = await decideEventRegistration(
       req.params.eventId,
       req.params.registrationId,
       req.user!.id,
       decision,
     );
-    res.status(200).json({ registration });
+    if (decision === 'approve') res.setHeader('Cache-Control', 'no-store');
+    res.status(200).json(result);
   } catch (error) {
     next(error);
   }
@@ -187,6 +200,27 @@ eventRouter.get('/:eventId/rsvps', listRsvps);
 eventRouter.get('/:eventId/rsvps/:registrationId', getRsvp);
 eventRouter.post('/:eventId/rsvps/:registrationId/approve', decideRsvp('approve'));
 eventRouter.post('/:eventId/rsvps/:registrationId/reject', decideRsvp('reject'));
+
+eventRouter.post('/:eventId/tickets/issue', async (req: Request<{ eventId: string }>, res, next) => {
+  try {
+    decisionBodySchema.parse(req.body ?? {});
+    const result = await issueMissingEventTickets(req.params.eventId, req.user!.id);
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(200).json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+eventRouter.get('/:eventId/attendees', async (req: Request<{ eventId: string }>, res, next) => {
+  try {
+    const pagination = attendeePaginationSchema.parse(req.query);
+    const result = await listEventAttendees(req.params.eventId, req.user!.id, pagination.page, pagination.pageSize);
+    res.status(200).json(result);
+  } catch (error) {
+    next(error);
+  }
+});
 
 eventRouter.patch('/:id', async (req, res, next) => {
   try {
