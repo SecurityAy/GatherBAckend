@@ -5,9 +5,25 @@ import { prisma } from '../../lib/prisma.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { env } from '../../config/env.js';
 import { enqueueNotification, notificationPayload } from '../notifications/notification-outbox.service.js';
+import type { TicketEmailBlock } from '../notifications/email-templates.js';
 import { countReservedGuestSpaces, lockEventCapacity } from './capacity.service.js';
 import { defaultDeviceContext, deviceRegistrationFilter, type DeviceContext } from './device.service.js';
-import { issueEligibleRegistrationTickets } from '../tickets/ticket.service.js';
+import { issueEligibleRegistrationTickets, ticketAccessUrl, type IssuedTicket } from '../tickets/ticket.service.js';
+
+function primaryTicketBlock(
+  tickets: IssuedTicket[],
+  primary: { id: string; firstName: string; lastName: string } | undefined,
+): TicketEmailBlock | undefined {
+  const ticket = tickets.find((candidate) => candidate.attendeeId === primary?.id);
+  if (!ticket || !primary) return undefined;
+  return {
+    ticketId: ticket.ticketId,
+    attendeeId: ticket.attendeeId,
+    attendeeName: `${primary.firstName} ${primary.lastName}`.trim(),
+    qrToken: ticket.qrToken,
+    ticketUrl: ticketAccessUrl(ticket.qrToken),
+  };
+}
 
 const guestNameSchema = z.string().trim().min(2).max(200).refine(
   (value) => value.split(/\s+/).length >= 2,
@@ -336,7 +352,7 @@ export async function submitRsvp(
           createdAt: true,
           attendees: {
             orderBy: [{ attendeeType: 'asc' }, { createdAt: 'asc' }],
-            select: { firstName: true, lastName: true, attendeeType: true },
+            select: { id: true, firstName: true, lastName: true, attendeeType: true },
           },
         },
       });
@@ -368,10 +384,17 @@ export async function submitRsvp(
           : undefined,
         invitationUrl: env.frontendUrl && currentEvent.slug ? `${env.frontendUrl.replace(/\/$/, '')}/event/${encodeURIComponent(currentEvent.slug)}` : undefined,
       } as const;
+      const primaryAttendee = createdRegistration.attendees.find((attendee) => attendee.attendeeType === AttendeeType.PRIMARY);
+      const autoApprovedTicket = primaryTicketBlock(issuedTickets, primaryAttendee);
       await enqueueNotification(transaction, createdRegistration.id, NotificationType.ORGANISER_NEW_RSVP, currentEvent.user.email,
         notificationPayload({ type: 'ORGANISER_NEW_RSVP', recipientEmail: currentEvent.user.email, ...basePayload }));
       await enqueueNotification(transaction, createdRegistration.id, NotificationType.GUEST_RSVP_RECEIVED, payload.primaryGuestEmail,
-        notificationPayload({ type: 'GUEST_RSVP_RECEIVED', recipientEmail: payload.primaryGuestEmail, ...basePayload }));
+        notificationPayload({
+          type: 'GUEST_RSVP_RECEIVED',
+          recipientEmail: payload.primaryGuestEmail,
+          ...basePayload,
+          ...(autoApprovedTicket ? { ticket: autoApprovedTicket } : {}),
+        }));
       return { registration: createdRegistration, tickets: issuedTickets };
     }, {
       // Large group RSVPs create one attendee (and often one ticket) per guest,
@@ -582,7 +605,7 @@ export async function decideEventRegistration(
         eventId,
         event: { is: { userId: ownerId, deletedAt: null } },
       },
-      select: { id: true, attendanceIntent: true, status: true, attendees: { where: { attendeeType: AttendeeType.PRIMARY }, select: { firstName: true, lastName: true, email: true } }, event: { select: { title: true, slug: true, eventDate: true, venueName: true, eventStatus: true } } },
+      select: { id: true, attendanceIntent: true, status: true, attendees: { where: { attendeeType: AttendeeType.PRIMARY }, select: { id: true, firstName: true, lastName: true, email: true } }, event: { select: { title: true, slug: true, eventDate: true, venueName: true, eventStatus: true } } },
     });
 
     if (!registration) {
@@ -655,6 +678,7 @@ export async function decideEventRegistration(
 
     const primary = registration.attendees[0];
     const notificationType = decision === 'approve' ? NotificationType.GUEST_RSVP_APPROVED : NotificationType.GUEST_RSVP_DECLINED;
+    const approvalTicket = decision === 'approve' ? primaryTicketBlock(issuedTickets, primary) : undefined;
     if (primary?.email) {
       await enqueueNotification(transaction, registration.id, notificationType, primary.email,
         notificationPayload({
@@ -668,6 +692,7 @@ export async function decideEventRegistration(
           eventDate: registration.event.eventDate?.toISOString() ?? null,
           venue: registration.event.venueName,
           invitationUrl: env.frontendUrl && registration.event.slug ? `${env.frontendUrl.replace(/\/$/, '')}/event/${encodeURIComponent(registration.event.slug)}` : undefined,
+          ...(approvalTicket ? { ticket: approvalTicket } : {}),
         }));
     }
 

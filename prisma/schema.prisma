@@ -51,6 +51,8 @@ enum NotificationType {
   GUEST_RSVP_RECEIVED
   GUEST_RSVP_APPROVED
   GUEST_RSVP_DECLINED
+  PASSWORD_RESET
+  TICKET_DELIVERY
 }
 
 enum NotificationStatus {
@@ -60,21 +62,32 @@ enum NotificationStatus {
   FAILED
 }
 
-model User {
-  id              String        @id @default(uuid())
-  firstName       String
-  lastName        String
-  email           String        @unique
-  passwordHash    String
-  emailVerifiedAt DateTime?
-  profileImageUrl String?
-  accountStatus   AccountStatus @default(ACTIVE)
-  createdAt       DateTime      @default(now())
-  updatedAt       DateTime      @updatedAt
+enum TicketDeliveryStatus {
+  NOT_SENT
+  SENT
+  FAILED
+}
 
-  events       Event[]
-  auditLogs    AuditLog[]
-  checkInsMade AttendanceCheckIn[] @relation("CheckedInBy")
+model User {
+  id                     String        @id @default(uuid())
+  firstName              String
+  lastName               String
+  email                  String        @unique
+  passwordHash           String
+  emailVerifiedAt        DateTime?
+  profileImageUrl        String?
+  accountStatus          AccountStatus @default(ACTIVE)
+  passwordResetTokenHash String?       @unique @db.Char(64)
+  passwordResetExpiresAt DateTime?
+  emailNotifications     Boolean       @default(true)
+  locale                 String        @default("en")
+  createdAt              DateTime      @default(now())
+  updatedAt              DateTime      @updatedAt
+
+  events        Event[]
+  auditLogs     AuditLog[]
+  checkInsMade  AttendanceCheckIn[]  @relation("CheckedInBy")
+  notifications NotificationOutbox[]
 }
 
 model Event {
@@ -132,8 +145,8 @@ model RSVPRegistration {
   createdAt              DateTime           @default(now())
   updatedAt              DateTime           @updatedAt
 
-  event     Event      @relation(fields: [eventId], references: [id], onDelete: Restrict)
-  attendees Attendee[]
+  event         Event                @relation(fields: [eventId], references: [id], onDelete: Restrict)
+  attendees     Attendee[]
   notifications NotificationOutbox[]
 
   @@index([eventId, status])
@@ -143,24 +156,32 @@ model RSVPRegistration {
 }
 
 model NotificationOutbox {
-  id             String             @id @default(uuid())
-  registrationId String
-  type           NotificationType
-  recipientEmail String
-  status         NotificationStatus @default(PENDING)
-  payload        Json
-  attemptCount   Int                @default(0)
-  nextRetryAt    DateTime           @default(now())
+  id              String             @id @default(uuid())
+  registrationId  String?
+  userId          String?
+  ticketId        String?
+  dedupeKey       String?
+  type            NotificationType
+  recipientEmail  String
+  status          NotificationStatus @default(PENDING)
+  payload         Json
+  attemptCount    Int                @default(0)
+  nextRetryAt     DateTime           @default(now())
   processingUntil DateTime?
-  lastError      String?
-  createdAt      DateTime           @default(now())
-  updatedAt      DateTime           @updatedAt
-  sentAt         DateTime?
+  lastError       String?
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+  sentAt          DateTime?
 
-  registration RSVPRegistration @relation(fields: [registrationId], references: [id], onDelete: Cascade)
+  registration RSVPRegistration? @relation(fields: [registrationId], references: [id], onDelete: Cascade)
+  user         User?             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ticket       Ticket?           @relation(fields: [ticketId], references: [id], onDelete: Cascade)
 
   @@unique([registrationId, type])
+  @@unique([dedupeKey, type])
   @@index([status, nextRetryAt])
+  @@index([userId, type])
+  @@index([ticketId, type])
 }
 
 model Attendee {
@@ -181,17 +202,22 @@ model Attendee {
 }
 
 model Ticket {
-  id           String       @id @default(uuid())
-  attendeeId   String       @unique
-  qrTokenHash  String       @unique @db.Char(64)
-  ticketStatus TicketStatus @default(ISSUED)
-  issuedAt     DateTime     @default(now())
-  usedAt       DateTime?
-  createdAt    DateTime     @default(now())
-  updatedAt    DateTime     @updatedAt
+  id                String               @id @default(uuid())
+  attendeeId        String               @unique
+  qrTokenHash       String               @unique @db.Char(64)
+  ticketStatus      TicketStatus         @default(ISSUED)
+  deliveryStatus    TicketDeliveryStatus @default(NOT_SENT)
+  lastDeliveryAt    DateTime?
+  deliveryAttempts  Int                  @default(0)
+  lastDeliveryError String?
+  issuedAt          DateTime             @default(now())
+  usedAt            DateTime?
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
 
-  attendee   Attendee           @relation(fields: [attendeeId], references: [id], onDelete: Restrict)
-  attendance AttendanceCheckIn?
+  attendee      Attendee             @relation(fields: [attendeeId], references: [id], onDelete: Restrict)
+  attendance    AttendanceCheckIn?
+  notifications NotificationOutbox[]
 
   @@index([ticketStatus])
 }

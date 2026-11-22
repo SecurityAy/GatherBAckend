@@ -4,6 +4,7 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import morgan from 'morgan';
 import { env } from './config/env.js';
 import { prisma } from './lib/prisma.js';
+import meRouter from './modules/account/account.routes.js';
 import authRouter from './modules/auth/auth.routes.js';
 import eventRouter from './modules/events/event.routes.js';
 import ticketRouter from './modules/tickets/ticket.routes.js';
@@ -125,6 +126,7 @@ app.get('/health/ready', async (_req, res) => {
 });
 
 app.use('/api/auth', authRouter);
+app.use('/api/me', meRouter);
 app.use('/api/events', eventRouter);
 app.use('/api/tickets', ticketRouter);
 

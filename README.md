@@ -13,9 +13,10 @@ This project is a backend scaffold for the Gather graduation invitation platform
 2. Set up a PostgreSQL database (the current deployment uses Supabase).
 3. Copy `.env.example` to `.env` and configure `DATABASE_URL`, `DIRECT_URL`, and `JWT_SECRET`.
 4. Generate the Prisma Client: `npm run prisma:generate`
-5. Start the API: `npm run dev`
+5. Apply reviewed migrations to your own database: `npx prisma migrate deploy` (use `npm.cmd exec -- prisma migrate deploy` on Windows; production requires an explicit backup and deployment step)
+6. Start the API: `npm run dev`
 
-The initial Prisma migration has been applied to the configured Supabase database. Review migration SQL before preparing future migrations.
+The initial Prisma migration has been applied to the configured Supabase database. Review migration SQL before preparing future migrations; this work did not apply any migration to production.
 
 Set `CORS_ORIGINS` to a comma-separated list of exact frontend origins (for local Vite development, `http://localhost:5173,http://127.0.0.1:5173`). In production, `CORS_ORIGINS` is required; the API does not allow arbitrary browser origins. CORS allows the API methods and `Authorization`, `Content-Type`, and `x-device-id` headers, with credentialed cookies enabled for the signed device cookie.
 
@@ -102,11 +103,67 @@ Public rate limits are 5 RSVP submissions per IP per hour and 20 confirmation/ca
 
 ## Transactional email notifications
 
-RSVP creation and organiser decisions write idempotent notification jobs to the PostgreSQL outbox in the same transaction as the RSVP change. A background worker sends the four transactional notification types through Resend and retries transient failures up to five attempts. Jobs are claimed with `FOR UPDATE SKIP LOCKED`, use a two-minute lease and a Resend `Idempotency-Key`, and expose failures through `NotificationOutbox.status`, `attemptCount`, and `lastError`. Without `RESEND_API_KEY`, jobs remain pending and RSVP operations continue normally. Configure `RESEND_API_KEY` and `RESEND_FROM_EMAIL` in the backend environment; the default sender is `onboarding@resend.dev`, which Resend restricts to verified test recipients. `FRONTEND_URL` is optional and is used only to form public invitation links. Additional guests are not emailed.
+RSVP creation and organiser decisions write idempotent notification jobs to the PostgreSQL outbox in the same transaction as the RSVP change. A background worker sends six transactional notification types through Resend and retries transient failures up to five attempts: `ORGANISER_NEW_RSVP`, `GUEST_RSVP_RECEIVED`, `GUEST_RSVP_APPROVED`, `GUEST_RSVP_DECLINED`, `PASSWORD_RESET`, and `TICKET_DELIVERY`. Jobs are claimed with `FOR UPDATE SKIP LOCKED`, use a two-minute lease and a Resend `Idempotency-Key`, and expose failures through `NotificationOutbox.status`, `attemptCount`, and `lastError`. Without `RESEND_API_KEY`, jobs remain pending and RSVP operations continue normally. Configure `RESEND_API_KEY` and `RESEND_FROM_EMAIL` in the backend environment; the default sender is `onboarding@resend.dev`, which Resend restricts to verified test recipients. `FRONTEND_URL` is optional and is used only to form public invitation, password reset, and ticket links. Additional guests are not emailed individually; the primary ticket is included in the primary guest's approval/RSVP email. Raw `qrToken`, `resetUrl`, `ticketUrl`, and other token-like payload fields are redacted after a successful send, and reset tokens are single-use.
 
 The worker can run in the web process (the default) or as a separate deployment. For separate workers, set `EMAIL_WORKER_IN_WEB=false` on the web service and run `npm run worker` locally or `npm run start:worker` from the built output. Multiple worker instances can safely share the outbox because claims are row-locked and delivery is idempotent. `EMAIL_WORKER_IN_WEB=true|false` is validated at startup.
 
+New optional environment variables:
+
+- `PASSWORD_RESET_URL` — absolute HTTP(S) URL of the frontend reset page. The backend appends `?token=<resetToken>` (or `&token=` when a query string is present). If unset, it falls back to `${FRONTEND_URL}/reset-password`; if both are unset, forgot-password requests still return the generic response but no email is queued.
+- `PASSWORD_RESET_TTL_MINUTES` — integer reset-link lifetime from 5 to 1440 minutes; default `60`. A new request replaces the outstanding token and supersedes any queued reset email for that user.
+
+`emailNotifications` is stored as a user preference but does not suppress security messages (password reset or ticket delivery). `locale` is stored for future i18n; email copy is currently English only.
+
 For safe local integration tests, put the disposable Neon test database URLs in ignored `.env.test.local` and run `npm run test:safe`. The runner validates both URLs point to Neon database `gather_rsvp_test`, applies migrations to that database, then runs the suite. It requires no production `.env` database fallback. Production migrations are not applied by this runner or by Vercel; run `prisma migrate deploy` with production `DATABASE_URL` and `DIRECT_URL` as a separate deployment step. The `20261121130000_enforce_rsvp_duplicate_rules` migration requires PostgreSQL 14+ for `sha256()` and the `btree_gist` extension.
+
+## Migration runbook and rollback
+
+No migration in this work was applied to production. Apply only after a verified database backup, with the email worker stopped or drained, and with the previous application version ready to redeploy if rollback is needed.
+
+Pending account/delivery migrations, in order:
+
+1. `20261122120000_add_account_notification_types` appends `PASSWORD_RESET` and `TICKET_DELIVERY` to the `NotificationType` enum used by `NotificationOutbox.type`.
+2. `20261122121000_add_account_self_service_and_ticket_delivery` creates the `TicketDeliveryStatus` enum; adds `User.passwordResetTokenHash` (`CHAR(64)`, unique index `User_passwordResetTokenHash_key`), `User.passwordResetExpiresAt`, `User.emailNotifications` (default `true`), and `User.locale` (default `en`); makes `NotificationOutbox.registrationId` nullable, adds `userId`, `ticketId`, and `dedupeKey`, adds cascade FKs `NotificationOutbox_userId_fkey` and `NotificationOutbox_ticketId_fkey`, the unique index `NotificationOutbox_dedupeKey_type_key`, and indexes `NotificationOutbox_userId_type_idx` / `NotificationOutbox_ticketId_type_idx` while retaining `NotificationOutbox_registrationId_type_key`; and adds `Ticket.deliveryStatus` (default `NOT_SENT`), `lastDeliveryAt`, `deliveryAttempts`, and `lastDeliveryError`.
+
+Rollback order: deploy the previous application version first, keep the backup, then roll back `20261122121000...` with SQL equivalent to:
+
+```sql
+DELETE FROM "NotificationOutbox"
+WHERE "userId" IS NOT NULL OR "ticketId" IS NOT NULL OR "dedupeKey" IS NOT NULL
+   OR "type" IN ('PASSWORD_RESET', 'TICKET_DELIVERY');
+ALTER TABLE "NotificationOutbox" DROP CONSTRAINT IF EXISTS "NotificationOutbox_ticketId_fkey";
+ALTER TABLE "NotificationOutbox" DROP CONSTRAINT IF EXISTS "NotificationOutbox_userId_fkey";
+DROP INDEX IF EXISTS "NotificationOutbox_ticketId_type_idx";
+DROP INDEX IF EXISTS "NotificationOutbox_userId_type_idx";
+DROP INDEX IF EXISTS "NotificationOutbox_dedupeKey_type_key";
+ALTER TABLE "NotificationOutbox"
+  DROP COLUMN IF EXISTS "dedupeKey", DROP COLUMN IF EXISTS "ticketId", DROP COLUMN IF EXISTS "userId",
+  ALTER COLUMN "registrationId" SET NOT NULL;
+ALTER TABLE "Ticket"
+  DROP COLUMN IF EXISTS "lastDeliveryError", DROP COLUMN IF EXISTS "deliveryAttempts",
+  DROP COLUMN IF EXISTS "lastDeliveryAt", DROP COLUMN IF EXISTS "deliveryStatus";
+DROP TYPE IF EXISTS "TicketDeliveryStatus";
+DROP INDEX IF EXISTS "User_passwordResetTokenHash_key";
+ALTER TABLE "User"
+  DROP COLUMN IF EXISTS "locale", DROP COLUMN IF EXISTS "emailNotifications",
+  DROP COLUMN IF EXISTS "passwordResetExpiresAt", DROP COLUMN IF EXISTS "passwordResetTokenHash";
+```
+
+The `DELETE` removes queued password-reset/ticket-delivery messages because those rows have no registration id and cannot satisfy the restored `NOT NULL` constraint. PostgreSQL cannot remove enum values added with `ALTER TYPE ... ADD VALUE`; the safe rollback for `20261122120000...` is to leave `PASSWORD_RESET` and `TICKET_DELIVERY` present but unused. Removing them requires recreating `NotificationType` after ensuring no rows use them and the worker is stopped, so it is not part of the automatic rollback.
+
+The earlier device migrations are already in the repo and follow the same backup-first rule. `20261121120000_add_rsvp_device_hashes` adds `RSVPRegistration.deviceCookieHash` / `deviceClientHash` (`CHAR(64)`) and indexes `RSVPRegistration_eventId_deviceCookieHash_idx` / `RSVPRegistration_eventId_deviceClientHash_idx`. `20261121130000_enforce_rsvp_duplicate_rules` requires PostgreSQL 14+ and `btree_gist`, backfills `primaryEmailHash`, adds the exclusion constraint `RSVPRegistration_event_email_five_minute_excl` for active same-event/same-email rows within five minutes, and partial unique indexes `RSVPRegistration_eventId_deviceCookieHash_active_key` / `RSVPRegistration_eventId_deviceClientHash_active_key`. Before applying it, check for conflicting active rows; the migration will fail rather than silently merge them. To roll back, redeploy the earlier app, drop the two partial unique indexes and exclusion constraint, drop `primaryEmailHash`, then optionally drop the device hash columns and their indexes; leave the `btree_gist` extension installed.
+
+## Account self-service and password recovery
+
+All routes below are under `/api/me` except the auth routes, require a bearer token where indicated, return `X-Request-Id`, and set `Cache-Control: no-store`.
+
+- `POST /api/auth/forgot-password` with `{ "email": "..." }` always returns `200` with the same message, so callers cannot enumerate accounts. For an active account it stores only a SHA-256 hash of a random token, expires it after `PASSWORD_RESET_TTL_MINUTES`, and upserts one `PASSWORD_RESET` job keyed by user. A second request invalidates the earlier token and replaces the queued email.
+- `POST /api/auth/reset-password` with `{ "token": "...", "password": "..." }` consumes the token in a conditional update, bcrypt-hashes the new password, clears all password-reset jobs for the user, and returns `200`. Invalid or expired tokens return `400`.
+- `PATCH /api/auth/me` updates `firstName`, `lastName`, and/or `email` and returns the same safe user projection as registration/login. An email already used by another account returns `409`; changing the email also clears any outstanding reset token.
+- `POST /api/auth/change-password` verifies `currentPassword`, rejects an unchanged `newPassword`, replaces the bcrypt hash, and clears reset jobs. It does not revoke already-issued bearer tokens; JWTs have no per-token version and expire after seven days.
+- `GET /api/me/data-export` returns `{ exportedAt, user, events, registrations, checkIns, auditLogs }` with safe fields only. It includes owned events and registrations tied to those events or to the account's email; tokens, password hashes, and QR hashes are excluded.
+- `DELETE /api/me` sets `accountStatus: DELETED`, anonymizes the profile and password hash, clears reset state, and soft-deletes owned events. It is a soft/anonymizing deletion: event, registration, attendee, and audit history is retained for integrity, and guest RSVP rows are not rewritten. JWTs cannot be revoked individually, but `requireAuth` checks account status on every request, so existing tokens receive `403` after deletion.
+- `GET /api/me/preferences` and `PUT /api/me/preferences` read/update `{ emailNotifications, locale }`. `locale` accepts short tags such as `en` or `en-GB`.
 
 ## Individual attendee tickets and check-in
 
@@ -122,6 +179,7 @@ Authenticated event-owner endpoints:
 - `GET /api/events/:eventId/attendees?page=1&pageSize=50` returns `{ attendees, pagination }`. Each attendee contains `id`, `firstName`, `lastName`, `attendeeType`, `attendanceIntent`, `registrationStatus`, `hasTicket`, `ticketStatus` (`ISSUED`, `USED`, `VOID`, or `null`), `checkedIn`, and `checkedInAt`. QR tokens and hashes are never included. Page size is 1–100.
 - `GET /api/events/:eventId/tickets?page=1&pageSize=50` returns `{ tickets, pagination }`. Each ticket contains `id`, `attendeeId`, `attendeeName`, `ticketStatus`, `revoked` (true for `VOID`), `issuedAt`, `usedAt`, and `checkedInAt`. Tokens and hashes are never included.
 - `POST /api/events/:eventId/tickets/:ticketId/reissue` and `POST /api/events/:eventId/tickets/:ticketId/revoke` are additive ticket-id variants of the attendee routes above; reissue returns the raw token with `Cache-Control: no-store`.
+- `POST /api/events/:eventId/tickets/:ticketId/resend-email` requires an empty body and an `APPROVED`, `ATTENDING`, unscanned ticket in an active owned event. It rotates the token (invalidating earlier email links), resets delivery state to `NOT_SENT`, and upserts one `TICKET_DELIVERY` job using `ticket-delivery:<ticketId>` as the dedupe key. The response contains only `{ ticketId, attendeeId, deliveryStatus, message }` with `Cache-Control: no-store`; the raw token is delivered only to the email worker. The email uses a token link under `${FRONTEND_URL}/tickets?token=...`; no QR image is generated.
 - `GET /api/events/:eventId/attendees`, `GET /api/events/:eventId/rsvps`, `GET /api/events/:eventId/tickets`, and `GET /api/events/:eventId/audit` return a content-derived `ETag` plus `Cache-Control: private, max-age=0, must-revalidate`. Clients can poll with `If-None-Match`; unchanged lists return `304` with an empty body. ETags are hashed from the public response bodies only.
 
 Ticket status meanings:
@@ -131,6 +189,8 @@ Ticket status meanings:
 | `ISSUED` | Active, not scanned | Allowed | Allowed |
 | `USED` | Successfully scanned | Rejected | Rejected |
 | `VOID` | Cancelled or revoked | Rejected | Rejected |
+
+Ticket list rows also include `deliveryStatus` (`NOT_SENT`, `SENT`, `FAILED`), `lastDeliveryAt`, `deliveryAttempts`, and `lastDeliveryError`. Delivery status is updated by the worker only for `TICKET_DELIVERY` jobs and is reset to `NOT_SENT` whenever a token is rotated by reissue or resend. Reissue rewrites any already queued delivery or approval email with the new token so a stale link is never emailed. The primary guest's ticket is embedded in `GUEST_RSVP_RECEIVED`/`GUEST_RSVP_APPROVED` emails as a `ticketUrl` token link.
 
 `POST /api/tickets/checkin` requires an authenticated owner of the supplied event and JSON `{ "eventId": "<UUID>", "qrToken": "<single-use token>" }`. It atomically marks the ticket used and creates its check-in record. It returns a safe attendee summary and `checkedInAt`. Check-in takes the same per-event advisory lock as issuance, cancellation, and reissue, and its conditional update includes the token hash, so a rotated token cannot be consumed by an in-flight scan. Concurrent scans produce exactly one success; repeat scans return `409` with `already been checked in`. Unknown, wrong-event, and rotated tokens return `404`; cancelled registrations, void tickets, and ineligible attendees return distinct `409` messages. Successful check-ins and reissues write `AuditLog` entries (`TICKET_CHECKED_IN`, `TICKET_REISSUED`) containing the actor, event, non-secret ticket identifiers, and time; raw tokens are never persisted. For a short client transition, `qrCode` is accepted as an alias for `qrToken`, but its value must now be a server-issued token.
 
@@ -163,5 +223,16 @@ All transitions re-check the status under the event advisory lock and use a cond
 - Sensitive organizer actions are recorded in `AuditLog` with actor, event, action, timestamp, and safe metadata only: event create/update/publish/unpublish/cancel/complete/delete, RSVP decisions and cancellations, ticket issue/reissue/revoke/check-in, and upload signing. Raw QR and confirmation tokens are never written to audit records. `GET /api/events/:eventId/audit?page=1&pageSize=20` is a read-only, owner-scoped view (`pageSize` max 100) that returns `entries` and `pagination` with `details` exactly as stored; audit rows cannot be edited through the API.
 - `npm test` and `npm run test:safe` run the safe suite; CI runs typechecking, whitespace checks, and the safe suite. `npm run test:direct` bypasses the database guard and should only be used deliberately.
 
+## Deployment smoke tests
+
+Use disposable accounts and events after a successful migration/deploy:
+
+1. `GET /health/ready` returns `200` and responses carry `X-Request-Id`.
+2. `POST /api/auth/forgot-password` with a known test account returns the generic `200` message; the `PASSWORD_RESET` outbox job reaches `SENT` when Resend is configured, the emailed link works once, and login with the new password succeeds. Repeating the forgot request invalidates the first link.
+3. `PATCH /api/auth/me`, `POST /api/auth/change-password`, `GET/PUT /api/me/preferences`, and `GET /api/me/data-export` return safe fields; after `DELETE /api/me`, the old bearer token receives `403`.
+4. Approve a test RSVP (or submit an auto-approval event) and confirm the primary guest's email contains one ticket link. `POST /api/events/:eventId/tickets/:ticketId/resend-email` returns `no-store`, rotates the token, sends a new link, and marks the ticket `SENT`; the older link no longer checks in.
+5. Poll `GET /api/events/:eventId/tickets` with its `ETag` in `If-None-Match`; an unchanged list returns `304`.
+6. Confirm token-bearing responses set `Cache-Control: no-store` and that no raw token appears in `AuditLog`, outbox payloads after delivery, application logs, or API responses for resend/data export.
+
 ## Notes
-See `API.md` for the consolidated route/auth/pagination contract. Authentication, event management, RSVP, ticket issuance, attendee listing, and ticket check-in use Prisma/PostgreSQL. The frontend RSVP and ticket-scanning flows are not verified as connected to these APIs. Existing QR-token delivery to guests is not implemented by this backend.
+See `API.md` for the consolidated route/auth/pagination contract. Authentication, event management, RSVP, ticket issuance, attendee listing, ticket check-in, account self-service, and ticket email delivery use Prisma/PostgreSQL. The frontend RSVP and ticket-scanning flows are not verified as connected to these APIs. QR image generation and group QR/photo delivery remain deferred; the backend sends a secure token link for the primary ticket.

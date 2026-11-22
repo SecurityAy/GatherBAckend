@@ -32,6 +32,28 @@ export function readResendConfiguration(apiKey?: string, fromEmail?: string) {
   return { apiKey: normalizedApiKey, fromEmail: normalizedFrom };
 }
 
+function readPasswordResetConfiguration() {
+  const rawUrl = process.env.PASSWORD_RESET_URL?.trim();
+  let passwordResetUrl: string | undefined;
+  if (rawUrl) {
+    try {
+      const parsed = new URL(rawUrl);
+      if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error();
+      passwordResetUrl = rawUrl.replace(/\/$/, '');
+    } catch {
+      throw new Error('Invalid application configuration: PASSWORD_RESET_URL must be an HTTP(S) URL.');
+    }
+  }
+
+  const rawTtl = process.env.PASSWORD_RESET_TTL_MINUTES?.trim();
+  const passwordResetTtlMinutes = rawTtl === undefined || rawTtl === '' ? 60 : Number(rawTtl);
+  if (!Number.isInteger(passwordResetTtlMinutes) || passwordResetTtlMinutes < 5 || passwordResetTtlMinutes > 1440) {
+    throw new Error('Invalid application configuration: PASSWORD_RESET_TTL_MINUTES must be an integer between 5 and 1440.');
+  }
+
+  return { passwordResetUrl, passwordResetTtlMinutes };
+}
+
 function validateConfiguration() {
   const jwtSecret = process.env.JWT_SECRET;
   if (!jwtSecret) {
@@ -139,11 +161,13 @@ function validateConfiguration() {
   }
 
   const resend = readResendConfiguration(process.env.RESEND_API_KEY, process.env.RESEND_FROM_EMAIL);
+  const passwordReset = readPasswordResetConfiguration();
   return {
     jwtSecret, databaseUrl, port, nodeEnv, corsOrigins, cloudinary: readCloudinaryConfiguration(),
     resend,
     emailWorkerInWeb: rawWorkerFlag === 'true',
     frontendUrl: process.env.FRONTEND_URL?.trim(),
+    ...passwordReset,
   };
 }
 
@@ -159,4 +183,6 @@ export const env = {
   resend: validatedConfig.resend,
   emailWorkerInWeb: validatedConfig.emailWorkerInWeb,
   frontendUrl: validatedConfig.frontendUrl,
+  passwordResetUrl: validatedConfig.passwordResetUrl,
+  passwordResetTtlMinutes: validatedConfig.passwordResetTtlMinutes,
 };

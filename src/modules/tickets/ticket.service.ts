@@ -1,11 +1,49 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { AttendanceIntent, EventStatus, Prisma, RegistrationStatus, TicketStatus } from '@prisma/client';
+import { AttendanceIntent, AttendeeType, EventStatus, Prisma, RegistrationStatus, TicketDeliveryStatus, TicketStatus } from '@prisma/client';
+import { env } from '../../config/env.js';
 import { prisma } from '../../lib/prisma.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { lockEventCapacity } from '../events/capacity.service.js';
+import { enqueueTicketDelivery, notificationPayload, supersedeQueuedRegistrationTicketLinks, supersedeTicketDelivery } from '../notifications/notification-outbox.service.js';
 
 function hashQrToken(token: string) {
   return createHash('sha256').update(token, 'utf8').digest('hex');
+}
+
+export function ticketAccessUrl(qrToken: string) {
+  if (!env.frontendUrl) return undefined;
+  return `${env.frontendUrl.replace(/\/$/, '')}/tickets?token=${encodeURIComponent(qrToken)}`;
+}
+
+type TicketDeliveryDetails = {
+  recipientEmail: string;
+  recipientName: string;
+  eventName: string;
+  eventDate?: string | null;
+  venue?: string | null;
+  invitationUrl?: string;
+  attendeeName: string;
+  ticketId: string;
+  attendeeId: string;
+};
+
+function ticketDeliveryPayload(details: TicketDeliveryDetails, qrToken: string) {
+  return notificationPayload({
+    type: 'TICKET_DELIVERY',
+    recipientEmail: details.recipientEmail,
+    recipientName: details.recipientName,
+    eventName: details.eventName,
+    eventDate: details.eventDate,
+    venue: details.venue,
+    invitationUrl: details.invitationUrl,
+    ticket: {
+      ticketId: details.ticketId,
+      attendeeId: details.attendeeId,
+      attendeeName: details.attendeeName,
+      qrToken,
+      ticketUrl: ticketAccessUrl(qrToken),
+    },
+  });
 }
 
 async function ensureTicketEventActive(
@@ -128,6 +166,15 @@ export async function reissueTicketForAttendee(eventId: string, attendeeId: stri
       },
       select: {
         id: true,
+        firstName: true,
+        lastName: true,
+        email: true,
+        registration: {
+          select: {
+            id: true,
+            event: { select: { slug: true, title: true, eventDate: true, venueName: true } },
+          },
+        },
         ticket: {
           select: {
             id: true,
@@ -160,7 +207,15 @@ export async function reissueTicketForAttendee(eventId: string, attendeeId: stri
           ticketStatus: TicketStatus.ISSUED,
           attendance: { is: null },
         },
-        data: { qrTokenHash, ticketStatus: TicketStatus.ISSUED, usedAt: null },
+        data: {
+          qrTokenHash,
+          ticketStatus: TicketStatus.ISSUED,
+          usedAt: null,
+          deliveryStatus: TicketDeliveryStatus.NOT_SENT,
+          lastDeliveryAt: null,
+          deliveryAttempts: 0,
+          lastDeliveryError: null,
+        },
       });
       if (rotated.count !== 1) {
         throw new HttpError(409, 'This ticket is no longer eligible for reissue.');
@@ -184,7 +239,163 @@ export async function reissueTicketForAttendee(eventId: string, attendeeId: stri
       },
     });
 
+    // A queued approval/RSVP email or delivery job must not send the old token.
+    await supersedeQueuedRegistrationTicketLinks(
+      tx,
+      attendee.registration.id,
+      ticketId,
+      qrToken,
+      ticketAccessUrl(qrToken),
+    );
+    const primaryAttendee = await tx.attendee.findFirst({
+      where: { registrationId: attendee.registration.id, attendeeType: AttendeeType.PRIMARY },
+      select: { email: true, firstName: true, lastName: true },
+    });
+    const recipientEmail = primaryAttendee?.email ?? attendee.email;
+    if (recipientEmail) {
+      const event = attendee.registration.event;
+      const invitationUrl = env.frontendUrl && event.slug
+        ? `${env.frontendUrl.replace(/\/$/, '')}/event/${encodeURIComponent(event.slug)}`
+        : undefined;
+      await supersedeTicketDelivery(
+        tx,
+        ticketId,
+        recipientEmail,
+        ticketDeliveryPayload({
+          recipientEmail,
+          recipientName: `${primaryAttendee?.firstName ?? attendee.firstName} ${primaryAttendee?.lastName ?? attendee.lastName}`.trim(),
+          eventName: event.title,
+          eventDate: event.eventDate?.toISOString() ?? null,
+          venue: event.venueName,
+          invitationUrl,
+          attendeeName: `${attendee.firstName} ${attendee.lastName}`.trim(),
+          ticketId,
+          attendeeId: attendee.id,
+        }, qrToken),
+        `ticket-delivery:${ticketId}`,
+      );
+    }
+
     return { attendeeId: attendee.id, ticketId, qrToken };
+  }, { maxWait: 10000, timeout: 30000 });
+}
+
+/**
+ * Rotates a ticket token and queues a delivery email in the same transaction.
+ * The raw token is only returned to the email worker; this endpoint response stays secret-free.
+ */
+export async function resendTicketEmailById(eventId: string, ticketId: string, ownerId: string) {
+  return prisma.$transaction(async (tx) => {
+    await lockEventCapacity(tx, eventId);
+    await ensureTicketEventActive(tx, eventId, ownerId);
+
+    const ticket = await tx.ticket.findFirst({
+      where: {
+        id: ticketId,
+        attendee: {
+          registration: {
+            eventId,
+            status: RegistrationStatus.APPROVED,
+            attendanceIntent: AttendanceIntent.ATTENDING,
+          },
+        },
+      },
+      select: {
+        id: true,
+        attendeeId: true,
+        ticketStatus: true,
+        attendance: { select: { id: true } },
+        attendee: {
+          select: {
+            firstName: true,
+            lastName: true,
+            email: true,
+            registration: {
+              select: {
+                id: true,
+                event: { select: { slug: true, title: true, eventDate: true, venueName: true } },
+              },
+            },
+          },
+        },
+      },
+    });
+    if (!ticket) throw new HttpError(404, 'Ticket not found for this event.');
+    if (ticket.attendance) throw new HttpError(409, 'A checked-in ticket cannot be resent.');
+    if (ticket.ticketStatus === TicketStatus.USED) throw new HttpError(409, 'A used ticket cannot be resent.');
+    if (ticket.ticketStatus === TicketStatus.VOID) throw new HttpError(409, 'A void ticket cannot be resent.');
+
+    const primaryAttendee = await tx.attendee.findFirst({
+      where: { registrationId: ticket.attendee.registration.id, attendeeType: AttendeeType.PRIMARY },
+      select: { email: true, firstName: true, lastName: true },
+    });
+    const recipientEmail = primaryAttendee?.email ?? ticket.attendee.email;
+    if (!recipientEmail) throw new HttpError(409, 'No email address is available for this ticket.');
+
+    const qrToken = randomBytes(32).toString('base64url');
+    const rotated = await tx.ticket.updateMany({
+      where: {
+        id: ticket.id,
+        ticketStatus: TicketStatus.ISSUED,
+        attendance: { is: null },
+      },
+      data: {
+        qrTokenHash: hashQrToken(qrToken),
+        deliveryStatus: TicketDeliveryStatus.NOT_SENT,
+        lastDeliveryAt: null,
+        deliveryAttempts: 0,
+        lastDeliveryError: null,
+      },
+    });
+    if (rotated.count !== 1) {
+      throw new HttpError(409, 'This ticket is no longer eligible for email delivery.');
+    }
+
+    await tx.auditLog.create({
+      data: {
+        actorId: ownerId,
+        eventId,
+        action: 'TICKET_REISSUED',
+        // Never persist the raw token or generated email link.
+        details: JSON.stringify({ ticketId: ticket.id, attendeeId: ticket.attendeeId, reason: 'EMAIL_RESEND' }),
+      },
+    });
+
+    const event = ticket.attendee.registration.event;
+    const invitationUrl = env.frontendUrl && event.slug
+      ? `${env.frontendUrl.replace(/\/$/, '')}/event/${encodeURIComponent(event.slug)}`
+      : undefined;
+    await enqueueTicketDelivery(
+      tx,
+      ticket.id,
+      recipientEmail,
+      ticketDeliveryPayload({
+        recipientEmail,
+        recipientName: `${primaryAttendee?.firstName ?? ticket.attendee.firstName} ${primaryAttendee?.lastName ?? ticket.attendee.lastName}`.trim(),
+        eventName: event.title,
+        eventDate: event.eventDate?.toISOString() ?? null,
+        venue: event.venueName,
+        invitationUrl,
+        attendeeName: `${ticket.attendee.firstName} ${ticket.attendee.lastName}`.trim(),
+        ticketId: ticket.id,
+        attendeeId: ticket.attendeeId,
+      }, qrToken),
+      `ticket-delivery:${ticket.id}`,
+    );
+    await supersedeQueuedRegistrationTicketLinks(
+      tx,
+      ticket.attendee.registration.id,
+      ticket.id,
+      qrToken,
+      ticketAccessUrl(qrToken),
+    );
+
+    return {
+      ticketId: ticket.id,
+      attendeeId: ticket.attendeeId,
+      deliveryStatus: TicketDeliveryStatus.NOT_SENT,
+      message: 'Ticket email queued.',
+    };
   }, { maxWait: 10000, timeout: 30000 });
 }
 
@@ -304,6 +515,9 @@ export async function listEventTickets(eventId: string, ownerId: string, page: n
         id: true,
         attendeeId: true,
         ticketStatus: true,
+        deliveryStatus: true,
+        lastDeliveryAt: true,
+        deliveryAttempts: true,
         issuedAt: true,
         usedAt: true,
         attendee: { select: { firstName: true, lastName: true } },
@@ -320,6 +534,9 @@ export async function listEventTickets(eventId: string, ownerId: string, page: n
       attendeeName: `${attendee.firstName} ${attendee.lastName}`.trim(),
       ticketStatus: ticket.ticketStatus,
       revoked: ticket.ticketStatus === TicketStatus.VOID,
+      deliveryStatus: ticket.deliveryStatus,
+      lastDeliveryAt: ticket.lastDeliveryAt,
+      deliveryAttempts: ticket.deliveryAttempts,
       issuedAt: ticket.issuedAt,
       usedAt: ticket.usedAt,
       checkedInAt: attendance?.checkedInAt ?? null,

@@ -35,6 +35,7 @@ import {
   listEventTickets,
   reissueTicketById,
   reissueTicketForAttendee,
+  resendTicketEmailById,
   revokeTicketById,
   revokeTicketForAttendee,
 } from '../tickets/ticket.service.js';
@@ -260,6 +261,22 @@ eventRouter.post('/:eventId/tickets/:ticketId/reissue', limitTicketMutation, asy
     decisionBodySchema.parse(req.body ?? {});
     const result = await reissueTicketById(req.params.eventId, req.params.ticketId, req.user!.id);
     // This response carries a raw QR token.
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(200).json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+eventRouter.post('/:eventId/tickets/:ticketId/resend-email', limitTicketMutation, async (
+  req: Request<{ eventId: string; ticketId: string }>,
+  res,
+  next,
+) => {
+  try {
+    decisionBodySchema.parse(req.body ?? {});
+    const result = await resendTicketEmailById(req.params.eventId, req.params.ticketId, req.user!.id);
+    // Queues a raw QR token for the mail worker; never allow this response to be cached.
     res.setHeader('Cache-Control', 'no-store');
     res.status(200).json(result);
   } catch (error) {

@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { after, test } from 'node:test';
-import { AccountStatus, AttendanceIntent, AttendeeType, EventStatus, NotificationStatus, NotificationType, RegistrationStatus, TicketStatus } from '@prisma/client';
+import { AccountStatus, AttendanceIntent, AttendeeType, EventStatus, NotificationStatus, NotificationType, RegistrationStatus, TicketDeliveryStatus, TicketStatus } from '@prisma/client';
+import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { ZodError } from 'zod';
 import { env, readResendConfiguration } from '../src/config/env.js';
@@ -3269,6 +3270,378 @@ test('audit feed and bulk RSVP decisions are owner-scoped, additive, and cache-v
     if (localServer) {
       await new Promise<void>((resolve, reject) => localServer!.close((error) => error ? reject(error) : resolve()));
       if (server === localServer) server = undefined;
+    }
+    if (eventIds.length) {
+      const eventFilter = { attendee: { registration: { eventId: { in: eventIds } } } };
+      await prisma.attendanceCheckIn.deleteMany({ where: { ticket: eventFilter } });
+      await prisma.ticket.deleteMany({ where: eventFilter });
+      await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: eventIds } } } });
+      await prisma.notificationOutbox.deleteMany({ where: { registration: { eventId: { in: eventIds } } } });
+      await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.auditLog.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.event.deleteMany({ where: { id: { in: eventIds } } });
+    }
+    if (userIds.length) {
+      await prisma.user.deleteMany({ where: { id: { in: userIds } } });
+    }
+  }
+});
+
+test('password recovery and account self-service stay additive and non-enumerating', async () => {
+  const localSuffix = randomUUID();
+  const userIds: string[] = [];
+  const eventIds: string[] = [];
+  let localServer: ReturnType<typeof app.listen> | undefined;
+  const originalResetUrl = env.passwordResetUrl;
+
+  try {
+    env.passwordResetUrl = 'https://gather-test.example/reset-password';
+    localServer = app.listen(0);
+    server = localServer;
+
+    const originalEmail = `account-self-${localSuffix}@example.test`;
+    const user = await prisma.user.create({
+      data: {
+        firstName: 'Account',
+        lastName: 'Self',
+        email: originalEmail,
+        passwordHash: await bcrypt.hash('OriginalPassword123!', 12),
+      },
+    });
+    userIds.push(user.id);
+    const ownedEvent = await prisma.event.create({
+      data: {
+        userId: user.id,
+        title: 'Self Service Event',
+        slug: `account-self-${localSuffix}`,
+        eventCategory: 'Test',
+        eventStatus: EventStatus.DRAFT,
+      },
+    });
+    eventIds.push(ownedEvent.id);
+
+    const authHeaders = {
+      Authorization: `Bearer ${accessToken(user.id)}`,
+      'Content-Type': 'application/json',
+    };
+
+    let response = await request('/api/me/preferences', { headers: authHeaders });
+    assert.equal(response.status, 200);
+    assert.ok(response.headers.get('x-request-id'));
+    assert.deepEqual(await response.json(), { preferences: { emailNotifications: true, locale: 'en' } });
+
+    response = await request('/api/me/preferences', {
+      method: 'PUT',
+      headers: authHeaders,
+      body: JSON.stringify({ emailNotifications: false, locale: 'en-GB' }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { preferences: { emailNotifications: false, locale: 'en-GB' } });
+
+    response = await request('/api/me/data-export', { headers: authHeaders });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    const exported = await response.json() as {
+      user: { email: string; emailNotifications: boolean; locale: string };
+      events: Array<{ id: string }>;
+    };
+    assert.equal(exported.user.email, originalEmail);
+    assert.equal(exported.user.emailNotifications, false);
+    assert.equal(exported.user.locale, 'en-GB');
+    assert.ok(exported.events.some((event) => event.id === ownedEvent.id));
+    const exportText = JSON.stringify(exported);
+    assert.ok(!exportText.includes('passwordHash'));
+    assert.ok(!exportText.includes('passwordResetTokenHash'));
+
+    const updatedEmail = `account-updated-${localSuffix}@example.test`;
+    response = await request('/api/auth/me', {
+      method: 'PATCH',
+      headers: authHeaders,
+      body: JSON.stringify({ firstName: 'Updated', email: updatedEmail }),
+    });
+    assert.equal(response.status, 200);
+    const profileUpdate = await response.json() as { user: { firstName: string; email: string } };
+    assert.equal(profileUpdate.user.firstName, 'Updated');
+    assert.equal(profileUpdate.user.email, updatedEmail);
+
+    response = await request('/api/auth/change-password', {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ currentPassword: 'WrongPassword123!', newPassword: 'ChangedPassword123!' }),
+    });
+    assert.equal(response.status, 401);
+    response = await request('/api/auth/change-password', {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ currentPassword: 'OriginalPassword123!', newPassword: 'ChangedPassword123!' }),
+    });
+    assert.equal(response.status, 200);
+
+    const unknownForgot = await request('/api/auth/forgot-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: `missing-${localSuffix}@example.test` }),
+    });
+    assert.equal(unknownForgot.status, 200);
+    const knownForgot = await request('/api/auth/forgot-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: updatedEmail }),
+    });
+    assert.equal(knownForgot.status, 200);
+    assert.deepEqual(await knownForgot.json(), await unknownForgot.json());
+
+    const resetJob = await prisma.notificationOutbox.findUniqueOrThrow({
+      where: { dedupeKey_type: { dedupeKey: `password-reset:${user.id}`, type: NotificationType.PASSWORD_RESET } },
+    });
+    const resetPayload = resetJob.payload as unknown as { resetUrl: string };
+    const resetToken = new URL(resetPayload.resetUrl).searchParams.get('token');
+    assert.ok(resetToken && resetToken.length >= 32);
+
+    const sentEmails: Array<{ subject: string; text: string }> = [];
+    setNotificationSenderForTests({
+      emails: {
+        send: async (input: any) => {
+          sentEmails.push({ subject: input.subject, text: input.text });
+          return { data: { id: 'mock-reset-send' }, error: null };
+        },
+      },
+    }, 'onboarding@resend.dev');
+    assert.equal(await runNotificationWorkerOnce(resetJob.id), true);
+    assert.equal(sentEmails.length, 1);
+    assert.ok(sentEmails[0].text.includes('reset your Gather password'));
+    const sentResetJob = await prisma.notificationOutbox.findUniqueOrThrow({ where: { id: resetJob.id } });
+    assert.equal(sentResetJob.status, NotificationStatus.SENT);
+    assert.ok(!JSON.stringify(sentResetJob.payload).includes(resetToken));
+
+    response = await request('/api/auth/reset-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: `${resetToken}invalid`, password: 'ResetPassword123!' }),
+    });
+    assert.equal(response.status, 400);
+    response = await request('/api/auth/reset-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: resetToken, password: 'ResetPassword123!' }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    assert.equal((await prisma.user.findUniqueOrThrow({ where: { id: user.id } })).passwordResetTokenHash, null);
+
+    response = await request('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: updatedEmail, password: 'ChangedPassword123!' }),
+    });
+    assert.equal(response.status, 401);
+    response = await request('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: updatedEmail, password: 'ResetPassword123!' }),
+    });
+    assert.equal(response.status, 200);
+
+    response = await request('/api/me', { method: 'DELETE', headers: authHeaders });
+    assert.equal(response.status, 200);
+    response = await request('/api/auth/me', { headers: authHeaders });
+    assert.equal(response.status, 403);
+    // Deletion also replaces the stored password hash, so login fails before the
+    // account-status check; existing bearer tokens are rejected with 403 above.
+    response = await request('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: updatedEmail, password: 'ResetPassword123!' }),
+    });
+    assert.equal(response.status, 401);
+  } finally {
+    setNotificationSenderForTests(undefined);
+    env.passwordResetUrl = originalResetUrl;
+    if (server === localServer) {
+      await new Promise<void>((resolve, reject) => localServer!.close((error) => error ? reject(error) : resolve()));
+      server = undefined;
+    }
+    if (eventIds.length) {
+      await prisma.attendanceCheckIn.deleteMany({
+        where: { ticket: { attendee: { registration: { eventId: { in: eventIds } } } } },
+      });
+      await prisma.ticket.deleteMany({ where: { attendee: { registration: { eventId: { in: eventIds } } } } });
+      await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: eventIds } } } });
+      await prisma.notificationOutbox.deleteMany({ where: { registration: { eventId: { in: eventIds } } } });
+      await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.auditLog.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.event.deleteMany({ where: { id: { in: eventIds } } });
+    }
+    if (userIds.length) {
+      await prisma.user.deleteMany({ where: { id: { in: userIds } } });
+    }
+  }
+});
+
+test('ticket email resend rotates tokens, dedupes jobs, and redacts delivered payloads', async () => {
+  const localSuffix = randomUUID();
+  const userIds: string[] = [];
+  const eventIds: string[] = [];
+  let localServer: ReturnType<typeof app.listen> | undefined;
+  const originalFrontendUrl = env.frontendUrl;
+
+  try {
+    env.frontendUrl = 'https://gather-test.example';
+    localServer = app.listen(0);
+    server = localServer;
+    const owner = await prisma.user.create({
+      data: {
+        firstName: 'Ticket',
+        lastName: 'Owner',
+        email: `ticket-email-owner-${localSuffix}@example.test`,
+        passwordHash: 'test-only-hash',
+      },
+    });
+    userIds.push(owner.id);
+    const event = await prisma.event.create({
+      data: {
+        userId: owner.id,
+        title: `Ticket Email Event ${localSuffix}`,
+        slug: `ticket-email-${localSuffix}`,
+        eventCategory: 'Test',
+        eventStatus: EventStatus.PUBLISHED,
+      },
+    });
+    eventIds.push(event.id);
+    const registration = await prisma.rSVPRegistration.create({
+      data: {
+        eventId: event.id,
+        attendanceIntent: AttendanceIntent.ATTENDING,
+        status: RegistrationStatus.APPROVED,
+      },
+    });
+    const attendee = await prisma.attendee.create({
+      data: {
+        registrationId: registration.id,
+        firstName: 'Primary',
+        lastName: 'Guest',
+        email: `ticket-email-guest-${localSuffix}@example.test`,
+        attendeeType: AttendeeType.PRIMARY,
+      },
+    });
+    const originalHash = createHash('sha256').update('old-ticket-token-only-for-test').digest('hex');
+    const ticket = await prisma.ticket.create({
+      data: { attendeeId: attendee.id, qrTokenHash: originalHash },
+    });
+    const authHeaders = {
+      Authorization: `Bearer ${accessToken(owner.id)}`,
+      'Content-Type': 'application/json',
+    };
+    const path = `/api/events/${event.id}/tickets/${ticket.id}/resend-email`;
+
+    let response = await request(`/api/events/${randomUUID()}/tickets/${ticket.id}/resend-email`, {
+      method: 'POST', headers: authHeaders, body: '{}',
+    });
+    assert.equal(response.status, 404);
+
+    response = await request(path, { method: 'POST', headers: authHeaders, body: '{}' });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    const firstBody = await response.json() as {
+      ticketId: string; deliveryStatus: TicketDeliveryStatus;
+    };
+    assert.equal(firstBody.ticketId, ticket.id);
+    assert.equal(firstBody.deliveryStatus, TicketDeliveryStatus.NOT_SENT);
+    assert.ok(!JSON.stringify(firstBody).includes('qrToken'));
+    const firstHash = (await prisma.ticket.findUniqueOrThrow({ where: { id: ticket.id } })).qrTokenHash;
+    assert.notEqual(firstHash, originalHash);
+
+    const job = await prisma.notificationOutbox.findUniqueOrThrow({
+      where: { dedupeKey_type: { dedupeKey: `ticket-delivery:${ticket.id}`, type: NotificationType.TICKET_DELIVERY } },
+    });
+    assert.equal(job.recipientEmail, attendee.email);
+    assert.equal(job.status, NotificationStatus.PENDING);
+    const deliveryPayload = job.payload as unknown as { ticket: { qrToken: string; ticketUrl: string } };
+    assert.match(deliveryPayload.ticket.qrToken, /^[A-Za-z0-9_-]{43}$/);
+    assert.ok(deliveryPayload.ticket.ticketUrl.includes(deliveryPayload.ticket.qrToken));
+    const rotatedToken = deliveryPayload.ticket.qrToken;
+    const approvalNotice = await prisma.notificationOutbox.create({
+      data: {
+        registrationId: registration.id,
+        type: NotificationType.GUEST_RSVP_APPROVED,
+        recipientEmail: attendee.email!,
+        payload: {
+          type: 'GUEST_RSVP_APPROVED',
+          recipientEmail: attendee.email,
+          guestName: 'Primary Guest',
+          guestEmail: attendee.email,
+          eventName: event.title,
+          attendanceIntent: 'ATTENDING',
+          status: 'APPROVED',
+          ticket: {
+            ticketId: ticket.id,
+            attendeeId: attendee.id,
+            attendeeName: 'Primary Guest',
+            qrToken: rotatedToken,
+            ticketUrl: `https://gather-test.example/tickets?token=${rotatedToken}`,
+          },
+        },
+      },
+    });
+
+    const sentEmails: Array<{ subject: string; text: string }> = [];
+    setNotificationSenderForTests({
+      emails: {
+        send: async (input: any) => {
+          sentEmails.push({ subject: input.subject, text: input.text });
+          return { data: { id: 'mock-ticket-send' }, error: null };
+        },
+      },
+    }, 'onboarding@resend.dev');
+    assert.equal(await runNotificationWorkerOnce(job.id), true);
+    assert.equal(sentEmails.length, 1);
+    assert.ok(sentEmails[0].subject.includes(event.title));
+    const deliveredJob = await prisma.notificationOutbox.findUniqueOrThrow({ where: { id: job.id } });
+    assert.equal(deliveredJob.status, NotificationStatus.SENT);
+    assert.ok(!JSON.stringify(deliveredJob.payload).includes(rotatedToken));
+    const deliveredPayload = deliveredJob.payload as unknown as { ticket: { qrToken: string; ticketUrl: string } };
+    assert.equal(deliveredPayload.ticket.qrToken, '[redacted]');
+    assert.equal(deliveredPayload.ticket.ticketUrl, '[redacted]');
+    const deliveredTicket = await prisma.ticket.findUniqueOrThrow({ where: { id: ticket.id } });
+    assert.equal(deliveredTicket.deliveryStatus, TicketDeliveryStatus.SENT);
+    assert.ok(deliveredTicket.lastDeliveryAt);
+
+    const reissued = await request(`/api/events/${event.id}/tickets/${ticket.id}/reissue`, {
+      method: 'POST', headers: authHeaders, body: '{}',
+    });
+    assert.equal(reissued.status, 200);
+    const reissuedBody = await reissued.json() as { qrToken: string };
+    assert.notEqual(reissuedBody.qrToken, rotatedToken);
+    const supersededJob = await prisma.notificationOutbox.findUniqueOrThrow({ where: { id: job.id } });
+    const supersededPayload = supersededJob.payload as unknown as { ticket: { qrToken: string } };
+    assert.equal(supersededJob.status, NotificationStatus.PENDING);
+    assert.equal(supersededPayload.ticket.qrToken, reissuedBody.qrToken);
+    const updatedApproval = await prisma.notificationOutbox.findUniqueOrThrow({ where: { id: approvalNotice.id } });
+    const updatedApprovalPayload = updatedApproval.payload as unknown as { ticket: { qrToken: string; ticketUrl: string } };
+    assert.equal(updatedApprovalPayload.ticket.qrToken, reissuedBody.qrToken);
+    assert.ok(updatedApprovalPayload.ticket.ticketUrl.includes(reissuedBody.qrToken));
+    assert.equal((await prisma.ticket.findUniqueOrThrow({ where: { id: ticket.id } })).deliveryStatus, TicketDeliveryStatus.NOT_SENT);
+
+    response = await request(path, { method: 'POST', headers: authHeaders, body: '{}' });
+    assert.equal(response.status, 200);
+    const secondHash = (await prisma.ticket.findUniqueOrThrow({ where: { id: ticket.id } })).qrTokenHash;
+    assert.notEqual(secondHash, firstHash);
+    assert.equal(await prisma.notificationOutbox.count({
+      where: { ticketId: ticket.id, type: NotificationType.TICKET_DELIVERY },
+    }), 1);
+    const requeuedJob = await prisma.notificationOutbox.findUniqueOrThrow({ where: { id: job.id } });
+    assert.equal(requeuedJob.status, NotificationStatus.PENDING);
+    assert.equal((await prisma.ticket.findUniqueOrThrow({ where: { id: ticket.id } })).deliveryStatus, TicketDeliveryStatus.NOT_SENT);
+
+    await prisma.ticket.update({ where: { id: ticket.id }, data: { ticketStatus: TicketStatus.VOID } });
+    response = await request(path, { method: 'POST', headers: authHeaders, body: '{}' });
+    assert.equal(response.status, 409);
+  } finally {
+    setNotificationSenderForTests(undefined);
+    env.frontendUrl = originalFrontendUrl;
+    if (server === localServer) {
+      await new Promise<void>((resolve, reject) => localServer!.close((error) => error ? reject(error) : resolve()));
+      server = undefined;
     }
     if (eventIds.length) {
       const eventFilter = { attendee: { registration: { eventId: { in: eventIds } } } };
