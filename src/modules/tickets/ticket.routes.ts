@@ -1,15 +1,19 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { requireAuth } from '../../middleware/auth.js';
+import { createRateLimiter } from '../../middleware/rateLimit.js';
 import { checkInEventTicket } from './ticket.service.js';
 
+const limitCheckIn = createRateLimiter({
+  maxRequests: 200, windowMs: 15 * 60 * 1000, keyPrefix: 'ticket-checkin', keySelector: (req) => req.user?.id,
+});
 const ticketRouter = Router();
 
 ticketRouter.use(requireAuth);
 
 ticketRouter.get('/validate/:qrCode', (req, res) => {
-  // Defence in depth: app-level redaction already masks this before Morgan; keep the
-  // retired 410 handler from echoing or propagating the raw credential either.
+  // Defence in depth: Morgan redacts ticket-path tokens in logs; keep the retired
+  // 410 handler from echoing or propagating the raw credential either.
   req.url = '/api/tickets/validate/[redacted]';
   req.originalUrl = req.url;
   res.status(410).json({
@@ -17,7 +21,7 @@ ticketRouter.get('/validate/:qrCode', (req, res) => {
   });
 });
 
-ticketRouter.post('/checkin', async (req, res, next) => {
+ticketRouter.post('/checkin', limitCheckIn, async (req, res, next) => {
   try {
     const payload = z.object({
       eventId: z.string().uuid(),

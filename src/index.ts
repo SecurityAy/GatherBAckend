@@ -4,7 +4,9 @@ import { stopNotificationWorker, startNotificationWorker } from './modules/notif
 
 const server = app.listen(env.port, () => {
   console.log(`Gather backend listening on http://localhost:${env.port}`);
-  startNotificationWorker();
+  if (env.emailWorkerInWeb) {
+    startNotificationWorker();
+  }
 });
 
 async function shutdown() {

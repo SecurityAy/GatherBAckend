@@ -28,7 +28,6 @@ const safeUserSelect = {
   lastName: true,
   email: true,
   accountStatus: true,
-  emailVerifiedAt: true,
   profileImageUrl: true,
   createdAt: true,
   updatedAt: true,

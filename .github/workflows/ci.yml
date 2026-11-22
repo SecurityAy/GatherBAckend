@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc -p tsconfig.json --noEmit
+
+      - name: Build
+        run: npm run build
+
+      - name: Check whitespace
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            git diff --check "origin/${GITHUB_BASE_REF}...HEAD"
+          else
+            git diff --check HEAD^ HEAD
+          fi
+
+      - name: Write safe test environment
+        env:
+          TEST_DATABASE_URL: ${{ secrets.TEST_DATABASE_URL }}
+          TEST_DIRECT_URL: ${{ secrets.TEST_DIRECT_URL }}
+        run: |
+          if [ -z "$TEST_DATABASE_URL" ] || [ -z "$TEST_DIRECT_URL" ]; then
+            echo "TEST_DATABASE_URL and TEST_DIRECT_URL secrets are required" >&2
+            exit 1
+          fi
+          printf 'DATABASE_URL=%s\nDIRECT_URL=%s\n' "$TEST_DATABASE_URL" "$TEST_DIRECT_URL" > .env.test.local
+
+      - name: Integration tests (safe test database)
+        run: npm test

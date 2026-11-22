@@ -1,9 +1,13 @@
 import { Router, type NextFunction, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { requireAuth } from '../../middleware/auth.js';
+import { sendWithEtag } from '../../middleware/cacheValidation.js';
+import { createRateLimiter } from '../../middleware/rateLimit.js';
 import { resolveDeviceContext, setDeviceCookie } from './device.service.js';
 import { createEventImageUploadSignature } from './image-upload.service.js';
 import {
+  cancelEvent,
+  completeEvent,
   createEvent,
   getEventById,
   getPublicEventBySlug,
@@ -23,43 +27,26 @@ import {
   parseRegistrationPagination,
   submitRsvp,
 } from './rsvp.service.js';
-import { issueMissingEventTickets, listEventAttendees, reissueTicketForAttendee } from '../tickets/ticket.service.js';
+import {
+  issueMissingEventTickets,
+  listEventAttendees,
+  listEventTickets,
+  reissueTicketById,
+  reissueTicketForAttendee,
+  revokeTicketById,
+  revokeTicketForAttendee,
+} from '../tickets/ticket.service.js';
 
 const eventRouter = Router();
 
-function createRateLimiter(maxRequests: number, windowMs: number) {
-  const requestsByIp = new Map<string, { count: number; resetAt: number }>();
-  const cleanup = setInterval(() => {
-    const now = Date.now();
-    for (const [ip, window] of requestsByIp) {
-      if (window.resetAt <= now) {
-        requestsByIp.delete(ip);
-      }
-    }
-  }, windowMs);
-  cleanup.unref();
-
-  return (req: Request, res: Response, next: NextFunction) => {
-    const key = req.ip ?? req.socket.remoteAddress ?? 'unknown';
-    const now = Date.now();
-    const current = requestsByIp.get(key);
-    const window = !current || current.resetAt <= now
-      ? { count: 0, resetAt: now + windowMs }
-      : current;
-
-    if (window.count >= maxRequests) {
-      res.setHeader('Retry-After', Math.max(1, Math.ceil((window.resetAt - now) / 1000)));
-      return res.status(429).json({ message: 'Too many requests. Please try again later.' });
-    }
-
-    window.count += 1;
-    requestsByIp.set(key, window);
-    return next();
-  };
-}
-
-const limitRsvpSubmission = createRateLimiter(5, 60 * 60 * 1000);
-const limitRsvpConfirmation = createRateLimiter(20, 15 * 60 * 1000);
+const limitRsvpSubmission = createRateLimiter({ maxRequests: 5, windowMs: 60 * 60 * 1000, keyPrefix: 'rsvp-submit' });
+const limitRsvpConfirmation = createRateLimiter({ maxRequests: 20, windowMs: 15 * 60 * 1000, keyPrefix: 'rsvp-confirm' });
+const limitUploadSigning = createRateLimiter({
+  maxRequests: 30, windowMs: 15 * 60 * 1000, keyPrefix: 'upload-sign', keySelector: (req) => req.user?.id,
+});
+const limitTicketMutation = createRateLimiter({
+  maxRequests: 30, windowMs: 15 * 60 * 1000, keyPrefix: 'ticket-mutation', keySelector: (req) => req.user?.id,
+});
 
 const paginationSchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
@@ -136,7 +123,7 @@ eventRouter.post('/', async (req, res, next) => {
   }
 });
 
-eventRouter.post('/:eventId/image-upload-signature', async (req: Request<{ eventId: string }>, res, next) => {
+eventRouter.post('/:eventId/image-upload-signature', limitUploadSigning, async (req: Request<{ eventId: string }>, res, next) => {
   try {
     imageUploadSignatureBodySchema.parse(req.body ?? {});
     const uploadSignature = await createEventImageUploadSignature(req.params.eventId, req.user!.id);
@@ -164,7 +151,7 @@ const listRsvps = async (req: Request<{ eventId: string }>, res: Response, next:
       pagination.page,
       pagination.pageSize,
     );
-    res.status(200).json(result);
+    sendWithEtag(req, res, result);
   } catch (error) {
     next(error);
   }
@@ -226,7 +213,7 @@ eventRouter.post('/:eventId/rsvps/:registrationId/cancel', async (
   }
 });
 
-eventRouter.post('/:eventId/tickets/issue', async (req: Request<{ eventId: string }>, res, next) => {
+eventRouter.post('/:eventId/tickets/issue', limitTicketMutation, async (req: Request<{ eventId: string }>, res, next) => {
   try {
     decisionBodySchema.parse(req.body ?? {});
     const result = await issueMissingEventTickets(req.params.eventId, req.user!.id);
@@ -237,7 +224,37 @@ eventRouter.post('/:eventId/tickets/issue', async (req: Request<{ eventId: strin
   }
 });
 
-eventRouter.post('/:eventId/attendees/:attendeeId/tickets/reissue', async (
+eventRouter.post('/:eventId/tickets/:ticketId/reissue', limitTicketMutation, async (
+  req: Request<{ eventId: string; ticketId: string }>,
+  res,
+  next,
+) => {
+  try {
+    decisionBodySchema.parse(req.body ?? {});
+    const result = await reissueTicketById(req.params.eventId, req.params.ticketId, req.user!.id);
+    // This response carries a raw QR token.
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(200).json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+eventRouter.post('/:eventId/tickets/:ticketId/revoke', limitTicketMutation, async (
+  req: Request<{ eventId: string; ticketId: string }>,
+  res,
+  next,
+) => {
+  try {
+    decisionBodySchema.parse(req.body ?? {});
+    const result = await revokeTicketById(req.params.eventId, req.params.ticketId, req.user!.id);
+    res.status(200).json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+eventRouter.post('/:eventId/attendees/:attendeeId/tickets/reissue', limitTicketMutation, async (
   req: Request<{ eventId: string; attendeeId: string }>,
   res,
   next,
@@ -253,11 +270,35 @@ eventRouter.post('/:eventId/attendees/:attendeeId/tickets/reissue', async (
   }
 });
 
+eventRouter.post('/:eventId/attendees/:attendeeId/tickets/revoke', limitTicketMutation, async (
+  req: Request<{ eventId: string; attendeeId: string }>,
+  res,
+  next,
+) => {
+  try {
+    decisionBodySchema.parse(req.body ?? {});
+    const result = await revokeTicketForAttendee(req.params.eventId, req.params.attendeeId, req.user!.id);
+    res.status(200).json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
 eventRouter.get('/:eventId/attendees', async (req: Request<{ eventId: string }>, res, next) => {
   try {
     const pagination = attendeePaginationSchema.parse(req.query);
     const result = await listEventAttendees(req.params.eventId, req.user!.id, pagination.page, pagination.pageSize);
-    res.status(200).json(result);
+    sendWithEtag(req, res, result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+eventRouter.get('/:eventId/tickets', async (req: Request<{ eventId: string }>, res, next) => {
+  try {
+    const pagination = attendeePaginationSchema.parse(req.query);
+    const result = await listEventTickets(req.params.eventId, req.user!.id, pagination.page, pagination.pageSize);
+    sendWithEtag(req, res, result);
   } catch (error) {
     next(error);
   }
@@ -284,6 +325,24 @@ eventRouter.post('/:id/publish', async (req, res, next) => {
 eventRouter.post('/:id/unpublish', async (req, res, next) => {
   try {
     const event = await unpublishEvent(req.params.id, req.user!.id);
+    res.status(200).json({ event });
+  } catch (error) {
+    next(error);
+  }
+});
+
+eventRouter.post('/:id/cancel', async (req, res, next) => {
+  try {
+    const event = await cancelEvent(req.params.id, req.user!.id);
+    res.status(200).json({ event });
+  } catch (error) {
+    next(error);
+  }
+});
+
+eventRouter.post('/:id/complete', async (req, res, next) => {
+  try {
+    const event = await completeEvent(req.params.id, req.user!.id);
     res.status(200).json({ event });
   } catch (error) {
     next(error);

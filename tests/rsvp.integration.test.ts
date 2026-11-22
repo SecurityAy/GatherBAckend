@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { after, test } from 'node:test';
-import { AttendanceIntent, AttendeeType, EventStatus, NotificationStatus, NotificationType, RegistrationStatus, TicketStatus } from '@prisma/client';
+import { AccountStatus, AttendanceIntent, AttendeeType, EventStatus, NotificationStatus, NotificationType, RegistrationStatus, TicketStatus } from '@prisma/client';
 import jwt from 'jsonwebtoken';
 import { ZodError } from 'zod';
 import { env, readResendConfiguration } from '../src/config/env.js';
@@ -372,6 +372,7 @@ test('public RSVP validation, persistence, confirmation, ownership, and throttli
       await prisma.ticket.deleteMany({ where: { attendee: { registration: { eventId: { in: testEventIds } } } } });
       await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: testEventIds } } } });
       await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: testEventIds } } });
+      await prisma.auditLog.deleteMany({ where: { eventId: { in: testEventIds } } });
       await prisma.event.deleteMany({ where: { id: { in: testEventIds } } });
     }
     if (testUserIds.length) {
@@ -687,6 +688,7 @@ test('event guest capacity accounts for reserved attendee rows and serializes su
       await prisma.ticket.deleteMany({ where: { attendee: { registration: { eventId: { in: eventIds } } } } });
       await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: eventIds } } } });
       await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.auditLog.deleteMany({ where: { eventId: { in: eventIds } } });
       await prisma.event.deleteMany({ where: { id: { in: eventIds } } });
     }
     if (userIds.length) await prisma.user.deleteMany({ where: { id: { in: userIds } } });
@@ -1064,15 +1066,25 @@ test('organiser RSVP decisions enforce ownership, pending state, and atomic tran
     assert.ok(await prisma.rSVPRegistration.findUnique({ where: { id: approval.id } }), 'provider failure must not roll back the approved RSVP');
 
     let concurrentSendCalls = 0;
+    let markSendStarted!: () => void;
+    const sendStarted = new Promise<void>((resolve) => { markSendStarted = resolve; });
+    let releaseSend!: () => void;
+    const sendReleased = new Promise<void>((resolve) => { releaseSend = resolve; });
     setNotificationSenderForTests({ emails: { send: async () => {
       concurrentSendCalls += 1;
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      markSendStarted();
+      await sendReleased;
       return { data: { id: 'mock-send' }, error: null };
     } } }, 'onboarding@resend.dev');
-    const [workerOne, workerTwo] = await Promise.all([
-      runNotificationWorkerOnce(declineNotice!.id),
-      runNotificationWorkerOnce(declineNotice!.id),
-    ]);
+
+    const firstWorker = runNotificationWorkerOnce(declineNotice!.id);
+    // Once the first worker is inside the send call, its claim transaction has
+    // committed and the row is leased. A second worker must skip it without opening
+    // a competing claim transaction, which the pooled test database cannot sustain.
+    await sendStarted;
+    const workerTwo = await runNotificationWorkerOnce(declineNotice!.id);
+    releaseSend();
+    const workerOne = await firstWorker;
     assert.equal(Number(workerOne) + Number(workerTwo), 1);
     assert.equal(concurrentSendCalls, 1);
     assert.equal((await prisma.notificationOutbox.findUniqueOrThrow({ where: { id: declineNotice!.id } })).status, NotificationStatus.SENT);
@@ -1105,6 +1117,7 @@ test('organiser RSVP decisions enforce ownership, pending state, and atomic tran
       await prisma.ticket.deleteMany({ where: { attendee: { registration: { eventId: { in: testEventIds } } } } });
       await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: testEventIds } } } });
       await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: testEventIds } } });
+      await prisma.auditLog.deleteMany({ where: { eventId: { in: testEventIds } } });
       await prisma.event.deleteMany({ where: { id: { in: testEventIds } } });
     }
     if (testUserIds.length) {
@@ -1259,6 +1272,7 @@ test('event image upload signatures are owner-scoped and sign server-controlled 
       server = undefined;
     }
     if (testEventIds.length) {
+      await prisma.auditLog.deleteMany({ where: { eventId: { in: testEventIds } } });
       await prisma.event.deleteMany({ where: { id: { in: testEventIds } } });
     }
     if (testUserIds.length) {
@@ -1281,6 +1295,7 @@ test('Resend configuration gaps preserve RSVP flows and acknowledgements render 
       await prisma.ticket.deleteMany({ where: { attendee: { registration: { eventId: { in: staleIds } } } } });
       await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: staleIds } } } });
       await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: staleIds } } });
+      await prisma.auditLog.deleteMany({ where: { eventId: { in: staleIds } } });
       await prisma.event.deleteMany({ where: { id: { in: staleIds } } });
       await prisma.user.deleteMany({ where: { email: { startsWith: 'mail-owner-' } } });
     }
@@ -1362,6 +1377,7 @@ test('Resend configuration gaps preserve RSVP flows and acknowledgements render 
       await prisma.ticket.deleteMany({ where: { attendee: { registration: { eventId } } } });
       await prisma.attendee.deleteMany({ where: { registration: { eventId } } });
       await prisma.rSVPRegistration.deleteMany({ where: { eventId } });
+      await prisma.auditLog.deleteMany({ where: { eventId } });
       await prisma.event.deleteMany({ where: { id: eventId } });
     }
     if (ownerId) await prisma.user.deleteMany({ where: { id: ownerId } });
@@ -1566,6 +1582,7 @@ test('auto-approved RSVPs issue usable tickets and ticket URLs are redacted befo
       await prisma.ticket.deleteMany({ where: { attendee: { registration: { eventId: { in: eventIds } } } } });
       await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: eventIds } } } });
       await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.auditLog.deleteMany({ where: { eventId: { in: eventIds } } });
       await prisma.event.deleteMany({ where: { id: { in: eventIds } } });
     }
     if (userIds.length) {
@@ -1761,6 +1778,7 @@ test('device-scoped RSVP reservations block repeats and hide the save-me-a-seat 
       await prisma.ticket.deleteMany({ where: { attendee: { registration: { eventId: { in: eventIds } } } } });
       await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: eventIds } } } });
       await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.auditLog.deleteMany({ where: { eventId: { in: eventIds } } });
       await prisma.event.deleteMany({ where: { id: { in: eventIds } } });
     }
     if (userIds.length) {
@@ -1935,7 +1953,7 @@ test('RSVP cancellation releases capacity and device locks, and ticket reissue i
     const organiserCancelled = await cancelAs(second.registration.id, owner.id);
     assert.equal(organiserCancelled.status, 200);
     const organiserResult = (await organiserCancelled.json()) as { voidedTickets: number };
-    assert.equal(organiserResult.voidedTickets, 1);
+    assert.equal(organiserResult.voidedTickets, 0, 'a checked-in ticket must not be voided');
 
     const stored = await prisma.rSVPRegistration.findMany({
       where: { eventId: event.id },
@@ -1952,8 +1970,9 @@ test('RSVP cancellation releases capacity and device locks, and ticket reissue i
       registration.attendees.map((attendee) => attendee.ticket).filter((ticket) => ticket !== null),
     );
     assert.equal(storedTickets.length, 2);
+    assert.equal(storedTickets.filter((ticket) => ticket.ticketStatus === TicketStatus.VOID).length, 1);
+    assert.equal(storedTickets.filter((ticket) => ticket.ticketStatus === TicketStatus.USED).length, 1);
     for (const ticket of storedTickets) {
-      assert.equal(ticket.ticketStatus, TicketStatus.VOID);
       assert.match(ticket.qrTokenHash, /^[a-f0-9]{64}$/);
     }
     const allTokens = [lostToken, secondToken, reissuedBody.qrToken];
@@ -1973,6 +1992,7 @@ test('RSVP cancellation releases capacity and device locks, and ticket reissue i
       await prisma.ticket.deleteMany({ where: { attendee: { registration: { eventId: { in: eventIds } } } } });
       await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: eventIds } } } });
       await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.auditLog.deleteMany({ where: { eventId: { in: eventIds } } });
       await prisma.event.deleteMany({ where: { id: { in: eventIds } } });
     }
     if (userIds.length) {
@@ -2116,6 +2136,7 @@ test('database enforces sliding duplicate RSVP window and active device uniquene
       await prisma.ticket.deleteMany({ where: { attendee: { registration: { eventId: { in: eventIds } } } } });
       await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: eventIds } } } });
       await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.auditLog.deleteMany({ where: { eventId: { in: eventIds } } });
       await prisma.event.deleteMany({ where: { id: { in: eventIds } } });
     }
     if (userIds.length) {
@@ -2307,6 +2328,759 @@ test('ticket check-in is atomic, audited, and safe against void and reissue race
       await prisma.ticket.deleteMany({ where: { attendee: { registration: { eventId: { in: eventIds } } } } });
       await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: eventIds } } } });
       await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.event.deleteMany({ where: { id: { in: eventIds } } });
+    }
+    if (userIds.length) {
+      await prisma.user.deleteMany({ where: { id: { in: userIds } } });
+    }
+  }
+});
+
+test('publishing validates dates and guest-limit changes respect existing reservations', async () => {
+  const localSuffix = randomUUID();
+  const userIds: string[] = [];
+  const eventIds: string[] = [];
+  let localServer: ReturnType<typeof app.listen> | undefined;
+  let addressIndex = 0;
+  const nextIp = () => `198.40.${Math.floor(addressIndex / 250)}.${(addressIndex++ % 250) + 1}`;
+
+  try {
+    const owner = await prisma.user.create({
+      data: {
+        firstName: 'Publish',
+        lastName: 'Owner',
+        email: `publish-${localSuffix}-owner@example.test`,
+        passwordHash: 'test-only-hash',
+      },
+    });
+    userIds.push(owner.id);
+
+    const futureEventDate = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    const futureDeadline = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000);
+    const event = await prisma.event.create({
+      data: {
+        userId: owner.id,
+        title: 'Publish Validation Event',
+        slug: `publish-validation-${localSuffix}`,
+        eventCategory: 'Test',
+        eventStatus: EventStatus.DRAFT,
+        graduateName: 'Test Graduate',
+        venueName: 'Test Venue',
+        timezone: 'America/New_York',
+        eventDate: futureEventDate,
+        rsvpDeadline: futureDeadline,
+        additionalGuestLimit: 2,
+        maxGuestCapacity: 200,
+      },
+    });
+    eventIds.push(event.id);
+
+    localServer = app.listen(0);
+    server = localServer;
+    await new Promise<void>((resolve, reject) => {
+      localServer!.once('listening', resolve);
+      localServer!.once('error', reject);
+    });
+
+    const headers = {
+      Authorization: `Bearer ${accessToken(owner.id)}`,
+      'Content-Type': 'application/json',
+    };
+    const patch = (data: Record<string, unknown>) => request(`/api/events/${event.id}`, {
+      method: 'PATCH', headers, body: JSON.stringify(data),
+    });
+    const publish = () => request(`/api/events/${event.id}/publish`, { method: 'POST', headers });
+
+    const past = await patch({ eventDate: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString() });
+    assert.equal(past.status, 200);
+    const pastPublish = await publish();
+    assert.equal(pastPublish.status, 400);
+    assert.match((await pastPublish.json() as { message: string }).message, /must be in the future/);
+
+    assert.equal((await patch({ eventDate: futureEventDate.toISOString() })).status, 200);
+    assert.equal((await patch({ rsvpDeadline: null })).status, 200);
+    const missingDeadline = await publish();
+    assert.equal(missingDeadline.status, 400);
+    assert.match((await missingDeadline.json() as { message: string }).message, /rsvpDeadline/);
+
+    assert.equal((await patch({ rsvpDeadline: new Date(Date.now() + 10 * 24 * 60 * 60 * 1000).toISOString() })).status, 200);
+    const lateDeadline = await publish();
+    assert.equal(lateDeadline.status, 400);
+    assert.match((await lateDeadline.json() as { message: string }).message, /before the event date/);
+
+    assert.equal((await patch({ timezone: 'Invalid/Zone' })).status, 200);
+    const invalidTimezone = await publish();
+    assert.equal(invalidTimezone.status, 400);
+    assert.match((await invalidTimezone.json() as { message: string }).message, /IANA timezone/);
+    assert.equal((await patch({ timezone: 'America/New_York' })).status, 200);
+
+    assert.equal((await patch({ rsvpDeadline: new Date(Date.now() - 60_000).toISOString() })).status, 200);
+    const pastDeadline = await publish();
+    assert.equal(pastDeadline.status, 400);
+    assert.match((await pastDeadline.json() as { message: string }).message, /deadline must be in the future/);
+
+    assert.equal((await patch({ rsvpDeadline: futureDeadline.toISOString() })).status, 200);
+    const validPublish = await publish();
+    assert.equal(validPublish.status, 200);
+
+    const publishedPastDate = await patch({ eventDate: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString() });
+    assert.equal(publishedPastDate.status, 400);
+    assert.match((await publishedPastDate.json() as { message: string }).message, /must be in the future/);
+    const publishedNullDeadline = await patch({ rsvpDeadline: null });
+    assert.equal(publishedNullDeadline.status, 400);
+    assert.match((await publishedNullDeadline.json() as { message: string }).message, /valid schedule.*rsvpDeadline/);
+    const publishedInvalidTimezone = await patch({ timezone: 'Invalid/Zone' });
+    assert.equal(publishedInvalidTimezone.status, 400);
+    assert.match((await publishedInvalidTimezone.json() as { message: string }).message, /IANA timezone/);
+    const publishedLateDeadline = await patch({
+      rsvpDeadline: new Date(Date.now() + 10 * 24 * 60 * 60 * 1000).toISOString(),
+    });
+    assert.equal(publishedLateDeadline.status, 400);
+    assert.match((await publishedLateDeadline.json() as { message: string }).message, /before the event date/);
+
+    const submit = async (email: string, names: string[]) => request(`/api/events/public/${event.slug}/rsvp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Device-Id': `publish-limit-${localSuffix}-${email.includes('many') ? 'many' : 'reserved'}`,
+        'X-Forwarded-For': nextIp(),
+      },
+      body: JSON.stringify(rsvpBody(email, { additionalGuestNames: names })),
+    });
+
+    const reserved = await submit(`publish-limit-${localSuffix}@example.test`, ['Guest One', 'Guest Two']);
+    assert.equal(reserved.status, 201);
+
+    const loweredLimit = await patch({ additionalGuestLimit: 1 });
+    assert.equal(loweredLimit.status, 409);
+    assert.match((await loweredLimit.json() as { message: string }).message, /already reserved/);
+
+    const equalLimit = await patch({ additionalGuestLimit: 2 });
+    assert.equal(equalLimit.status, 200);
+    const raisedLimit = await patch({ additionalGuestLimit: 1000 });
+    assert.equal(raisedLimit.status, 200);
+
+    const manyNames = Array.from({ length: 60 }, (_, index) => `Extra Guest ${index + 1}`);
+    const aboveOldCap = await submit(`publish-many-${localSuffix}@example.test`, manyNames);
+    assert.equal(aboveOldCap.status, 201, 'request validation must allow more than 50 names when the event permits it');
+  } finally {
+    if (localServer) {
+      await new Promise<void>((resolve, reject) => localServer!.close((error) => error ? reject(error) : resolve()));
+      if (server === localServer) server = undefined;
+    }
+    if (eventIds.length) {
+      await prisma.attendanceCheckIn.deleteMany({
+        where: { ticket: { attendee: { registration: { eventId: { in: eventIds } } } } },
+      });
+      await prisma.ticket.deleteMany({ where: { attendee: { registration: { eventId: { in: eventIds } } } } });
+      await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: eventIds } } } });
+      await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.auditLog.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.event.deleteMany({ where: { id: { in: eventIds } } });
+    }
+    if (userIds.length) {
+      await prisma.user.deleteMany({ where: { id: { in: userIds } } });
+    }
+  }
+});
+
+test('operational endpoints, terminal event transitions, and ticket revocation are enforced', async () => {
+  const localSuffix = randomUUID();
+  const userIds: string[] = [];
+  const eventIds: string[] = [];
+  let localServer: ReturnType<typeof app.listen> | undefined;
+  let addressIndex = 0;
+  const nextIp = () => `198.41.${Math.floor(addressIndex / 250)}.${(addressIndex++ % 250) + 1}`;
+
+  try {
+    const owner = await prisma.user.create({
+      data: {
+        firstName: 'Ops',
+        lastName: 'Owner',
+        email: `ops-${localSuffix}@example.test`,
+        passwordHash: 'test-only-hash',
+      },
+    });
+    userIds.push(owner.id);
+
+    const futureEventDate = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000);
+    const futureDeadline = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    const createEventRow = async (name: string) => {
+      const event = await prisma.event.create({
+        data: {
+          userId: owner.id,
+          title: `Ops ${name}`,
+          slug: `ops-${name}-${localSuffix}`,
+          eventCategory: 'Test',
+          eventStatus: EventStatus.DRAFT,
+          graduateName: 'Test Graduate',
+          venueName: 'Test Venue',
+          timezone: 'America/New_York',
+          eventDate: futureEventDate,
+          rsvpDeadline: futureDeadline,
+        },
+      });
+      eventIds.push(event.id);
+      return event;
+    };
+
+    localServer = app.listen(0);
+    server = localServer;
+    await new Promise<void>((resolve, reject) => {
+      localServer!.once('listening', resolve);
+      localServer!.once('error', reject);
+    });
+
+    const headers = { Authorization: `Bearer ${accessToken(owner.id)}` };
+    const health = await request('/health');
+    assert.equal(health.status, 200);
+    assert.match(health.headers.get('x-request-id') ?? '', /^[A-Za-z0-9._-]{1,64}$/);
+    assert.equal(health.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(health.headers.get('x-frame-options'), 'DENY');
+    assert.equal(health.headers.get('referrer-policy'), 'no-referrer');
+    assert.match(health.headers.get('content-security-policy') ?? '', /default-src 'none'/);
+
+    const ready = await request('/health/ready');
+    assert.equal(ready.status, 200);
+    assert.deepEqual(await ready.json(), { status: 'ready' });
+
+    const completeEvent = await createEventRow('complete');
+    const completedRegistration = await prisma.rSVPRegistration.create({
+      data: {
+        eventId: completeEvent.id,
+        attendanceIntent: AttendanceIntent.ATTENDING,
+        status: RegistrationStatus.PENDING,
+        attendees: {
+          create: [{
+            firstName: 'Completed',
+            lastName: 'Guest',
+            attendeeType: AttendeeType.PRIMARY,
+            email: `ops-complete-${localSuffix}@example.test`,
+          }],
+        },
+      },
+      select: { id: true },
+    });
+    assert.equal((await request(`/api/events/${completeEvent.id}/publish`, { method: 'POST', headers })).status, 200);
+    const completed = await request(`/api/events/${completeEvent.id}/complete`, { method: 'POST', headers });
+    assert.equal(completed.status, 200);
+    assert.equal(((await completed.json()) as { event: { eventStatus: EventStatus } }).event.eventStatus, EventStatus.COMPLETED);
+    const completedPatch = await request(`/api/events/${completeEvent.id}`, {
+      method: 'PATCH',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Cannot change' }),
+    });
+    assert.equal(completedPatch.status, 409);
+    assert.equal((await request(`/api/events/${completeEvent.id}/publish`, { method: 'POST', headers })).status, 409);
+    const lifecycleAudits = await prisma.auditLog.findMany({
+      where: { eventId: completeEvent.id, action: { in: ['EVENT_PUBLISHED', 'EVENT_COMPLETED'] } },
+      select: { action: true, actorId: true },
+    });
+    assert.deepEqual(lifecycleAudits.map((item) => item.action).sort(), ['EVENT_COMPLETED', 'EVENT_PUBLISHED']);
+    assert.ok(lifecycleAudits.every((item) => item.actorId === owner.id));
+    const blockedIssue = await request(`/api/events/${completeEvent.id}/tickets/issue`, { method: 'POST', headers });
+    assert.equal(blockedIssue.status, 409, 'ticket operations are blocked after completion');
+    const blockedDecision = await request(`/api/events/${completeEvent.id}/rsvps/${completedRegistration.id}/approve`, {
+      method: 'POST', headers,
+    });
+    assert.equal(blockedDecision.status, 409, 'RSVP decisions are blocked after completion');
+
+    const cancelEvent = await createEventRow('cancel');
+    assert.equal((await request(`/api/events/${cancelEvent.id}/publish`, { method: 'POST', headers })).status, 200);
+    const submission = await request(`/api/events/public/${cancelEvent.slug}/rsvp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Device-Id': `ops-revoke-${localSuffix}`,
+        'X-Forwarded-For': nextIp(),
+      },
+      body: JSON.stringify(rsvpBody(`ops-revoke-${localSuffix}@example.test`)),
+    });
+    assert.equal(submission.status, 201);
+    const submissionBody = (await submission.json()) as { tickets: Array<{ attendeeId: string; ticketId: string; qrToken: string }> };
+    assert.equal(submissionBody.tickets.length, 1);
+    const ticket = submissionBody.tickets[0];
+
+    const revokePath = `/api/events/${cancelEvent.id}/attendees/${ticket.attendeeId}/tickets/revoke`;
+    const revoke = await request(revokePath, { method: 'POST', headers });
+    assert.equal(revoke.status, 200);
+    assert.equal(((await revoke.json()) as { ticketStatus: TicketStatus }).ticketStatus, TicketStatus.VOID);
+    const revokedScan = await request('/api/tickets/checkin', {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ eventId: cancelEvent.id, qrToken: ticket.qrToken }),
+    });
+    assert.equal(revokedScan.status, 409);
+    assert.equal((await request(revokePath, { method: 'POST', headers })).status, 409);
+
+    const cancelled = await request(`/api/events/${cancelEvent.id}/cancel`, { method: 'POST', headers });
+    assert.equal(cancelled.status, 200);
+    assert.equal(((await cancelled.json()) as { event: { eventStatus: EventStatus } }).event.eventStatus, EventStatus.CANCELLED);
+    assert.equal((await request(`/api/events/public/${cancelEvent.slug}/rsvp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Device-Id': `ops-after-cancel-${localSuffix}`,
+        'X-Forwarded-For': nextIp(),
+      },
+      body: JSON.stringify(rsvpBody(`ops-after-cancel-${localSuffix}@example.test`)),
+    })).status, 404);
+    assert.equal((await request(`/api/events/${cancelEvent.id}/cancel`, { method: 'POST', headers })).status, 409);
+    const cancelAudit = await prisma.auditLog.findFirst({
+      where: { eventId: cancelEvent.id, action: 'EVENT_CANCELLED' },
+      select: { actorId: true },
+    });
+    assert.equal(cancelAudit?.actorId, owner.id);
+    const blockedIssueAfterCancel = await request(`/api/events/${cancelEvent.id}/tickets/issue`, { method: 'POST', headers });
+    assert.equal(blockedIssueAfterCancel.status, 409, 'ticket operations are blocked after cancellation');
+  } finally {
+    if (localServer) {
+      await new Promise<void>((resolve, reject) => localServer!.close((error) => error ? reject(error) : resolve()));
+      if (server === localServer) server = undefined;
+    }
+    if (eventIds.length) {
+      await prisma.attendanceCheckIn.deleteMany({
+        where: { ticket: { attendee: { registration: { eventId: { in: eventIds } } } } },
+      });
+      await prisma.ticket.deleteMany({ where: { attendee: { registration: { eventId: { in: eventIds } } } } });
+      await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: eventIds } } } });
+      await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.auditLog.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.event.deleteMany({ where: { id: { in: eventIds } } });
+    }
+    if (userIds.length) {
+      await prisma.user.deleteMany({ where: { id: { in: userIds } } });
+    }
+  }
+});
+
+test('organizer authorization, unpublish transitions, and error responses are enforced', async () => {
+  const localSuffix = randomUUID();
+  const userIds: string[] = [];
+  const eventIds: string[] = [];
+  let localServer: ReturnType<typeof app.listen> | undefined;
+
+  try {
+    const [owner, otherOwner, suspendedUser] = await Promise.all([
+      prisma.user.create({
+        data: {
+          firstName: 'Auth',
+          lastName: 'Owner',
+          email: `auth-owner-${localSuffix}@example.test`,
+          passwordHash: 'test-only-hash',
+        },
+      }),
+      prisma.user.create({
+        data: {
+          firstName: 'Foreign',
+          lastName: 'Owner',
+          email: `auth-foreign-${localSuffix}@example.test`,
+          passwordHash: 'test-only-hash',
+        },
+      }),
+      prisma.user.create({
+        data: {
+          firstName: 'Suspended',
+          lastName: 'Owner',
+          email: `auth-suspended-${localSuffix}@example.test`,
+          passwordHash: 'test-only-hash',
+          accountStatus: AccountStatus.SUSPENDED,
+        },
+      }),
+    ]);
+    userIds.push(owner.id, otherOwner.id, suspendedUser.id);
+
+    const futureEventDate = new Date(Date.now() + 10 * 24 * 60 * 60 * 1000);
+    const futureDeadline = new Date(Date.now() + 5 * 24 * 60 * 60 * 1000);
+    const createEventRow = async (name: string) => {
+      const event = await prisma.event.create({
+        data: {
+          userId: owner.id,
+          title: `Auth ${name}`,
+          slug: `auth-${name}-${localSuffix}`,
+          eventCategory: 'Test',
+          eventStatus: EventStatus.DRAFT,
+          graduateName: 'Test Graduate',
+          venueName: 'Test Venue',
+          timezone: 'America/New_York',
+          eventDate: futureEventDate,
+          rsvpDeadline: futureDeadline,
+        },
+      });
+      eventIds.push(event.id);
+      return event;
+    };
+
+    const event = await createEventRow('scope');
+    const registration = await prisma.rSVPRegistration.create({
+      data: {
+        eventId: event.id,
+        attendanceIntent: AttendanceIntent.ATTENDING,
+        status: RegistrationStatus.PENDING,
+        attendees: {
+          create: [{
+            firstName: 'Auth',
+            lastName: 'Guest',
+            attendeeType: AttendeeType.PRIMARY,
+            email: `auth-guest-${localSuffix}@example.test`,
+          }],
+        },
+      },
+      select: { id: true, attendees: { select: { id: true } } },
+    });
+    const attendeeId = registration.attendees[0].id;
+
+    localServer = app.listen(0);
+    server = localServer;
+    await new Promise<void>((resolve, reject) => {
+      localServer!.once('listening', resolve);
+      localServer!.once('error', reject);
+    });
+
+    const authCredentials = {
+      firstName: 'Token',
+      lastName: 'Owner',
+      email: `auth-token-${localSuffix}@example.test`,
+      password: 'safe-test-password',
+    };
+    const authBody = { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(authCredentials) };
+    const registeredResponse = await request('/api/auth/register', { method: 'POST', ...authBody });
+    assert.equal(registeredResponse.status, 201);
+    assert.equal(registeredResponse.headers.get('cache-control'), 'no-store');
+    const registered = await registeredResponse.json() as { user: { id: string } };
+    userIds.push(registered.user.id);
+    const loginResponse = await request('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: authCredentials.email, password: authCredentials.password }),
+    });
+    assert.equal(loginResponse.status, 200);
+    assert.equal(loginResponse.headers.get('cache-control'), 'no-store');
+
+    const withHeaders = (headers: Record<string, string>, init?: RequestInit): RequestInit => ({
+      ...init,
+      headers: { ...(init?.headers as Record<string, string> | undefined), ...headers },
+    });
+    const ownerHeaders = { Authorization: `Bearer ${accessToken(owner.id)}` };
+    const foreignHeaders = { Authorization: `Bearer ${accessToken(otherOwner.id)}` };
+    const jsonPatch = {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Foreign update' }),
+    };
+    const protectedRequests: Array<{ path: string; init?: RequestInit }> = [
+      { path: `/api/events/${event.id}` },
+      { path: `/api/events/${event.id}`, init: jsonPatch },
+      { path: `/api/events/${event.id}`, init: { method: 'DELETE' } },
+      { path: `/api/events/${event.id}/publish`, init: { method: 'POST' } },
+      { path: `/api/events/${event.id}/unpublish`, init: { method: 'POST' } },
+      { path: `/api/events/${event.id}/cancel`, init: { method: 'POST' } },
+      { path: `/api/events/${event.id}/complete`, init: { method: 'POST' } },
+      { path: `/api/events/${event.id}/image-upload-signature`, init: { method: 'POST' } },
+      { path: `/api/events/${event.id}/rsvps` },
+      { path: `/api/events/${event.id}/rsvps/${registration.id}` },
+      { path: `/api/events/${event.id}/rsvps/${registration.id}/approve`, init: { method: 'POST' } },
+      { path: `/api/events/${event.id}/rsvps/${registration.id}/reject`, init: { method: 'POST' } },
+      { path: `/api/events/${event.id}/rsvps/${registration.id}/cancel`, init: { method: 'POST' } },
+      { path: `/api/events/${event.id}/tickets/issue`, init: { method: 'POST' } },
+      { path: `/api/events/${event.id}/attendees` },
+      { path: `/api/events/${event.id}/attendees/${attendeeId}/tickets/reissue`, init: { method: 'POST' } },
+      { path: `/api/events/${event.id}/attendees/${attendeeId}/tickets/revoke`, init: { method: 'POST' } },
+    ];
+
+    for (const { path, init } of protectedRequests) {
+      assert.equal((await request(path, init)).status, 401, `${path} requires authentication`);
+      assert.equal(
+        (await request(path, withHeaders(foreignHeaders, init))).status,
+        404,
+        `${path} is scoped to the owning user`,
+      );
+    }
+
+    assert.equal((await request('/api/auth/me')).status, 401);
+    assert.equal((await request('/api/auth/me', withHeaders({ Authorization: 'Bearer invalid-token' }))).status, 401);
+    assert.equal((await request('/api/auth/me', withHeaders({
+      Authorization: `Bearer ${accessToken(suspendedUser.id)}`,
+    }))).status, 403);
+
+    const notFound = await request('/api/not-a-real-route');
+    assert.equal(notFound.status, 404);
+    assert.deepEqual(await notFound.json(), { message: 'Route not found.' });
+
+    const health = await request('/health');
+    assert.equal(health.headers.get('cross-origin-opener-policy'), 'same-origin');
+    assert.match(health.headers.get('permissions-policy') ?? '', /camera=\(\)/);
+    if (env.nodeEnv === 'production') {
+      assert.match(health.headers.get('strict-transport-security') ?? '', /max-age=31536000/);
+    } else {
+      assert.equal(health.headers.get('strict-transport-security'), null);
+    }
+
+    const transitionEvent = await createEventRow('unpublish');
+    assert.equal((await request(`/api/events/${transitionEvent.id}/publish`, {
+      method: 'POST', headers: ownerHeaders,
+    })).status, 200);
+    const unpublished = await request(`/api/events/${transitionEvent.id}/unpublish`, {
+      method: 'POST', headers: ownerHeaders,
+    });
+    assert.equal(unpublished.status, 200);
+    assert.equal(((await unpublished.json()) as { event: { eventStatus: EventStatus } }).event.eventStatus, EventStatus.UNPUBLISHED);
+    assert.equal((await request(`/api/events/${transitionEvent.id}/unpublish`, {
+      method: 'POST', headers: ownerHeaders,
+    })).status, 409);
+    assert.equal((await request(`/api/events/${transitionEvent.id}/publish`, {
+      method: 'POST', headers: ownerHeaders,
+    })).status, 200);
+    const transitionAudits = await prisma.auditLog.findMany({
+      where: {
+        eventId: transitionEvent.id,
+        action: { in: ['EVENT_PUBLISHED', 'EVENT_UNPUBLISHED'] },
+      },
+      select: { action: true, actorId: true },
+    });
+    assert.deepEqual(
+      transitionAudits.map((item) => item.action).sort(),
+      ['EVENT_PUBLISHED', 'EVENT_PUBLISHED', 'EVENT_UNPUBLISHED'],
+    );
+    assert.ok(transitionAudits.every((item) => item.actorId === owner.id));
+  } finally {
+    if (localServer) {
+      await new Promise<void>((resolve, reject) => localServer!.close((error) => error ? reject(error) : resolve()));
+      if (server === localServer) server = undefined;
+    }
+    if (eventIds.length) {
+      await prisma.ticket.deleteMany({ where: { attendee: { registration: { eventId: { in: eventIds } } } } });
+      await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: eventIds } } } });
+      await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.auditLog.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.event.deleteMany({ where: { id: { in: eventIds } } });
+    }
+    if (userIds.length) {
+      await prisma.user.deleteMany({ where: { id: { in: userIds } } });
+    }
+  }
+});
+
+test('event check-in totals, cache validators, and ticket-id operations are additive', async () => {
+  const localSuffix = randomUUID();
+  const userIds: string[] = [];
+  const eventIds: string[] = [];
+  const registrationIds: string[] = [];
+  let localServer: ReturnType<typeof app.listen> | undefined;
+
+  try {
+    const [owner, foreignOwner] = await Promise.all([
+      prisma.user.create({
+        data: {
+          firstName: 'Totals',
+          lastName: 'Owner',
+          email: `totals-owner-${localSuffix}@example.test`,
+          passwordHash: 'test-only-hash',
+        },
+      }),
+      prisma.user.create({
+        data: {
+          firstName: 'Foreign',
+          lastName: 'Owner',
+          email: `totals-foreign-${localSuffix}@example.test`,
+          passwordHash: 'test-only-hash',
+        },
+      }),
+    ]);
+    userIds.push(owner.id, foreignOwner.id);
+
+    const event = await prisma.event.create({
+      data: {
+        userId: owner.id,
+        title: 'Totals Event',
+        slug: `totals-event-${localSuffix}`,
+        eventCategory: 'Test',
+        eventStatus: EventStatus.DRAFT,
+        graduateName: 'Test Graduate',
+        venueName: 'Test Venue',
+        timezone: 'America/New_York',
+        eventDate: new Date(Date.now() + 10 * 24 * 60 * 60 * 1000),
+        rsvpDeadline: new Date(Date.now() + 5 * 24 * 60 * 60 * 1000),
+      },
+    });
+    eventIds.push(event.id);
+
+    const registration = await prisma.rSVPRegistration.create({
+      data: {
+        eventId: event.id,
+        attendanceIntent: AttendanceIntent.ATTENDING,
+        status: RegistrationStatus.APPROVED,
+      },
+    });
+    registrationIds.push(registration.id);
+    const [attendeeA, attendeeB, attendeeC] = await Promise.all([
+      prisma.attendee.create({
+        data: {
+          registrationId: registration.id,
+          firstName: 'Alice',
+          lastName: 'Guest',
+          email: `alice-${localSuffix}@example.test`,
+          attendeeType: AttendeeType.PRIMARY,
+        },
+      }),
+      prisma.attendee.create({
+        data: { registrationId: registration.id, firstName: 'Bob', lastName: 'Guest', attendeeType: AttendeeType.ADDITIONAL },
+      }),
+      prisma.attendee.create({
+        data: { registrationId: registration.id, firstName: 'Cara', lastName: 'Guest', attendeeType: AttendeeType.ADDITIONAL },
+      }),
+    ]);
+
+    const tokenA = `checked-in-${localSuffix}`;
+    const tokenB = `revoked-${localSuffix}`;
+    const tokenC = `reissue-${localSuffix}`;
+    const hashToken = (value: string) => createHash('sha256').update(value, 'utf8').digest('hex');
+    const ticketA = await prisma.ticket.create({
+      data: {
+        attendeeId: attendeeA.id,
+        qrTokenHash: hashToken(tokenA),
+        ticketStatus: TicketStatus.USED,
+        usedAt: new Date(),
+      },
+    });
+    await prisma.attendanceCheckIn.create({ data: { ticketId: ticketA.id, checkedInByUserId: owner.id } });
+    const ticketB = await prisma.ticket.create({
+      data: { attendeeId: attendeeB.id, qrTokenHash: hashToken(tokenB) },
+    });
+    const ticketC = await prisma.ticket.create({
+      data: { attendeeId: attendeeC.id, qrTokenHash: hashToken(tokenC) },
+    });
+
+    localServer = app.listen(0);
+    await new Promise<void>((resolve, reject) => {
+      localServer!.once('listening', resolve);
+      localServer!.once('error', reject);
+    });
+    server = localServer;
+
+    const ownerHeaders = { Authorization: `Bearer ${accessToken(owner.id)}` };
+    const foreignHeaders = { Authorization: `Bearer ${accessToken(foreignOwner.id)}` };
+    const jsonHeaders = { ...ownerHeaders, 'Content-Type': 'application/json' };
+
+    const listResponse = await request('/api/events?page=1&pageSize=50', { headers: ownerHeaders });
+    assert.equal(listResponse.status, 200);
+    const listed = await listResponse.json() as {
+      events: Array<{ id: string; counts: { checkedInCount: number } }>;
+    };
+    assert.equal(listed.events.find((item) => item.id === event.id)?.counts.checkedInCount, 1);
+
+    const detailResponse = await request(`/api/events/${event.id}`, { headers: ownerHeaders });
+    assert.equal(detailResponse.status, 200);
+    const detail = await detailResponse.json() as { event: { counts: { checkedInCount: number } } };
+    assert.equal(detail.event.counts.checkedInCount, 1);
+
+    const expectValidator = async (path: string) => {
+      const first = await request(path, { headers: ownerHeaders });
+      assert.equal(first.status, 200, `${path} is readable`);
+      const etag = first.headers.get('etag');
+      assert.ok(etag, `${path} returns an ETag`);
+      assert.match(first.headers.get('cache-control') ?? '', /must-revalidate/);
+      // Node fetch adds `cache-control: no-cache` alongside conditional headers;
+      // that must yield 200 per RFC 9111. Simulate a normal polling client instead.
+      const second = await request(path, {
+        headers: { ...ownerHeaders, 'If-None-Match': etag!, 'Cache-Control': 'max-age=0' },
+      });
+      assert.equal(second.status, 304, `${path} supports If-None-Match`);
+      assert.equal(await second.text(), '');
+      return etag!;
+    };
+    await expectValidator(`/api/events/${event.id}/attendees`);
+    await expectValidator(`/api/events/${event.id}/rsvps`);
+    const ticketsEtag = await expectValidator(`/api/events/${event.id}/tickets`);
+
+    const ticketsResponse = await request(`/api/events/${event.id}/tickets`, { headers: ownerHeaders });
+    const ticketsBody = await ticketsResponse.json() as {
+      tickets: Array<{ id: string; ticketStatus: TicketStatus; revoked: boolean; checkedInAt: string | null }>;
+    };
+    assert.equal(ticketsBody.tickets.length, 3);
+    const checkedInTicket = ticketsBody.tickets.find((item) => item.id === ticketA.id);
+    assert.ok(checkedInTicket);
+    assert.ok(checkedInTicket.checkedInAt);
+    const openTicket = ticketsBody.tickets.find((item) => item.id === ticketB.id);
+    assert.ok(openTicket);
+    assert.equal(openTicket.revoked, false);
+
+    const revoked = await request(`/api/events/${event.id}/tickets/${ticketB.id}/revoke`, {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: '{}',
+    });
+    assert.equal(revoked.status, 200);
+    assert.equal(((await revoked.json()) as { ticketStatus: TicketStatus }).ticketStatus, TicketStatus.VOID);
+    const ticketsAfterRevoke = await request(`/api/events/${event.id}/tickets`, { headers: ownerHeaders });
+    const afterRevokeBody = await ticketsAfterRevoke.json() as {
+      tickets: Array<{ id: string; revoked: boolean }>;
+    };
+    assert.equal(afterRevokeBody.tickets.find((item) => item.id === ticketB.id)?.revoked, true);
+    assert.notEqual(ticketsAfterRevoke.headers.get('etag'), ticketsEtag);
+
+    const revokedScan = await request('/api/tickets/checkin', {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify({ eventId: event.id, qrToken: tokenB }),
+    });
+    assert.equal(revokedScan.status, 409);
+    assert.match(((await revokedScan.json()) as { message: string }).message, /voided/i);
+
+    const reissued = await request(`/api/events/${event.id}/tickets/${ticketC.id}/reissue`, {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: '{}',
+    });
+    assert.equal(reissued.status, 200);
+    assert.equal(reissued.headers.get('cache-control'), 'no-store');
+    const reissuedBody = await reissued.json() as { qrToken: string; ticketId: string };
+    assert.equal(reissuedBody.ticketId, ticketC.id);
+    assert.notEqual(reissuedBody.qrToken, tokenC);
+
+    const staleScan = await request('/api/tickets/checkin', {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify({ eventId: event.id, qrToken: tokenC }),
+    });
+    assert.equal(staleScan.status, 404);
+
+    assert.equal((await request(`/api/events/${event.id}/tickets`, { headers: foreignHeaders })).status, 404);
+    assert.equal((await request(`/api/events/${event.id}/tickets/${randomUUID()}/revoke`, {
+      method: 'POST', headers: jsonHeaders, body: '{}',
+    })).status, 404);
+    assert.equal((await request(`/api/events/${event.id}/tickets/${ticketC.id}/reissue`, {
+      method: 'POST',
+      headers: { ...foreignHeaders, 'Content-Type': 'application/json' },
+      body: '{}',
+    })).status, 404);
+
+    await prisma.ticket.update({
+      where: { id: ticketC.id },
+      data: { ticketStatus: TicketStatus.USED, usedAt: new Date() },
+    });
+    await prisma.attendanceCheckIn.create({ data: { ticketId: ticketC.id, checkedInByUserId: owner.id } });
+    const detailAfter = await request(`/api/events/${event.id}`, { headers: ownerHeaders });
+    assert.equal(((await detailAfter.json()) as { event: { counts: { checkedInCount: number } } }).event.counts.checkedInCount, 2);
+    const ticketsRecheck = await request(`/api/events/${event.id}/tickets`, {
+      headers: { ...ownerHeaders, 'If-None-Match': ticketsEtag },
+    });
+    assert.equal(ticketsRecheck.status, 200);
+  } finally {
+    if (localServer) {
+      await new Promise<void>((resolve, reject) => localServer!.close((error) => error ? reject(error) : resolve()));
+      if (server === localServer) server = undefined;
+    }
+    if (registrationIds.length) {
+      const attendeeFilter = { attendee: { registrationId: { in: registrationIds } } };
+      await prisma.attendanceCheckIn.deleteMany({ where: { ticket: attendeeFilter } });
+      await prisma.ticket.deleteMany({ where: attendeeFilter });
+      await prisma.attendee.deleteMany({ where: { registrationId: { in: registrationIds } } });
+      await prisma.notificationOutbox.deleteMany({ where: { registrationId: { in: registrationIds } } });
+      await prisma.rSVPRegistration.deleteMany({ where: { id: { in: registrationIds } } });
+    }
+    if (eventIds.length) {
+      await prisma.auditLog.deleteMany({ where: { eventId: { in: eventIds } } });
       await prisma.event.deleteMany({ where: { id: { in: eventIds } } });
     }
     if (userIds.length) {

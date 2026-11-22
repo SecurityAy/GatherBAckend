@@ -3,7 +3,6 @@ import type { NextFunction, Request, Response } from 'express';
 import jwt, { type JwtPayload } from 'jsonwebtoken';
 import { env } from '../config/env.js';
 import { prisma } from '../lib/prisma.js';
-import { HttpError } from './errorHandler.js';
 
 type AuthenticatedUser = {
   id: string;
@@ -11,7 +10,6 @@ type AuthenticatedUser = {
   lastName: string;
   email: string;
   accountStatus: AccountStatus;
-  emailVerifiedAt: Date | null;
   profileImageUrl: string | null;
   createdAt: Date;
   updatedAt: Date;
@@ -54,7 +52,6 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
         lastName: true,
         email: true,
         accountStatus: true,
-        emailVerifiedAt: true,
         profileImageUrl: true,
         createdAt: true,
         updatedAt: true,
@@ -74,18 +71,4 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
   } catch (error) {
     return next(error);
   }
-}
-
-export function requireOwnerOrSelf(req: Request, res: Response, next: NextFunction) {
-  const resourceOwnerId = req.params.userId ?? req.params.id;
-
-  if (!req.user) {
-    return res.status(401).json({ message: 'Authentication required.' });
-  }
-
-  if (req.user.id === resourceOwnerId) {
-    return next();
-  }
-
-  return next(new HttpError(403, 'You do not have permission to access this resource.'));
 }

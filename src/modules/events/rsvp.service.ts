@@ -30,12 +30,30 @@ const rsvpSchema = z.object({
   primaryGuestPhone: primaryPhoneSchema,
   relationshipToGraduate: z.string().trim().min(1).max(100).optional(),
   attendanceIntent: z.nativeEnum(AttendanceIntent),
-  additionalGuestNames: z.array(guestNameSchema).max(50).default([]),
+  // Matches the maximum event-level additionalGuestLimit; per-event limits are enforced below.
+  additionalGuestNames: z.array(guestNameSchema).max(1000).default([]),
 }).strict();
 
 const confirmationSchema = z.object({
   token: z.string().regex(/^[A-Za-z0-9_-]{43}$/, 'Invalid confirmation token.'),
 }).strict();
+
+async function writeAudit(
+  writer: Pick<Prisma.TransactionClient, 'auditLog'>,
+  actorId: string | null,
+  eventId: string,
+  action: string,
+  details?: Record<string, unknown>,
+) {
+  await writer.auditLog.create({
+    data: {
+      actorId,
+      eventId,
+      action,
+      ...(details === undefined ? {} : { details: JSON.stringify(details) }),
+    },
+  });
+}
 
 const paginationSchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
@@ -329,6 +347,12 @@ export async function submitRsvp(
         createdRegistration.attendanceIntent === AttendanceIntent.ATTENDING
         ? await issueEligibleRegistrationTickets(transaction, createdRegistration.id, event.id)
         : [];
+      if (issuedTickets.length > 0) {
+        await writeAudit(transaction, null, event.id, 'TICKETS_ISSUED', {
+          registrationId: createdRegistration.id,
+          ticketCount: issuedTickets.length,
+        });
+      }
 
       const guestName = `${primaryName.firstName} ${primaryName.lastName}`.trim();
       const basePayload = {
@@ -350,9 +374,11 @@ export async function submitRsvp(
         notificationPayload({ type: 'GUEST_RSVP_RECEIVED', recipientEmail: payload.primaryGuestEmail, ...basePayload }));
       return { registration: createdRegistration, tickets: issuedTickets };
     }, {
+      // Large group RSVPs create one attendee (and often one ticket) per guest,
+      // so they legitimately need more time than a single-guest submission.
       isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
       maxWait: 10000,
-      timeout: 15000,
+      timeout: 30000,
     });
 
     return {
@@ -392,6 +418,8 @@ export async function getRsvpConfirmation(slug: string, input: unknown) {
 async function cancelRegistrationInTransaction(
   transaction: Prisma.TransactionClient,
   registration: { id: string; status: RegistrationStatus },
+  eventId: string,
+  actorId: string | null,
 ) {
   if (registration.status === RegistrationStatus.CANCELLED) {
     throw new HttpError(409, 'This reservation has already been cancelled.');
@@ -407,9 +435,16 @@ async function cancelRegistrationInTransaction(
   }
 
   // Cancelled registrations must not leave a usable QR token behind.
+  // Only active tickets are voided; a successful check-in is a historical fact and
+  // must remain USED so attendee state stays consistent.
   const voided = await transaction.ticket.updateMany({
-    where: { attendee: { registrationId: registration.id }, ticketStatus: { not: TicketStatus.VOID } },
+    where: { attendee: { registrationId: registration.id }, ticketStatus: TicketStatus.ISSUED },
     data: { ticketStatus: TicketStatus.VOID },
+  });
+
+  await writeAudit(transaction, actorId, eventId, 'RSVP_CANCELLED', {
+    registrationId: registration.id,
+    voidedTickets: voided.count,
   });
 
   return { cancelledAt, voidedTickets: voided.count };
@@ -450,7 +485,7 @@ export async function cancelRsvpByToken(slug: string, input: unknown) {
     if (!registration) {
       throw new HttpError(404, 'RSVP confirmation not found.');
     }
-    const outcome = await cancelRegistrationInTransaction(transaction, registration);
+    const outcome = await cancelRegistrationInTransaction(transaction, registration, existing.eventId, null);
     return cancelledResult(registration.id, outcome.cancelledAt, outcome.voidedTickets);
   }, { maxWait: 10000, timeout: 30000 });
 }
@@ -474,7 +509,7 @@ export async function cancelEventRegistration(
     if (!registration) {
       throw new HttpError(404, 'Registration not found.');
     }
-    const outcome = await cancelRegistrationInTransaction(transaction, registration);
+    const outcome = await cancelRegistrationInTransaction(transaction, registration, eventId, ownerId);
     return cancelledResult(registration.id, outcome.cancelledAt, outcome.voidedTickets);
   }, { maxWait: 10000, timeout: 30000 });
 }
@@ -547,11 +582,18 @@ export async function decideEventRegistration(
         eventId,
         event: { is: { userId: ownerId, deletedAt: null } },
       },
-      select: { id: true, attendanceIntent: true, status: true, attendees: { where: { attendeeType: AttendeeType.PRIMARY }, select: { firstName: true, lastName: true, email: true } }, event: { select: { title: true, slug: true, eventDate: true, venueName: true } } },
+      select: { id: true, attendanceIntent: true, status: true, attendees: { where: { attendeeType: AttendeeType.PRIMARY }, select: { firstName: true, lastName: true, email: true } }, event: { select: { title: true, slug: true, eventDate: true, venueName: true, eventStatus: true } } },
     });
 
     if (!registration) {
       throw new HttpError(404, 'Registration not found.');
+    }
+
+    if (
+      registration.event.eventStatus === EventStatus.CANCELLED ||
+      registration.event.eventStatus === EventStatus.COMPLETED
+    ) {
+      throw new HttpError(409, 'RSVP decisions are not available for a cancelled or completed event.');
     }
 
     if (registration.status !== RegistrationStatus.PENDING) {
@@ -569,7 +611,11 @@ export async function decideEventRegistration(
         eventId,
         status: RegistrationStatus.PENDING,
         ...(decision === 'approve' ? { attendanceIntent: AttendanceIntent.ATTENDING } : {}),
-        event: { is: { userId: ownerId, deletedAt: null } },
+        event: { is: {
+          userId: ownerId,
+          deletedAt: null,
+          eventStatus: { notIn: [EventStatus.CANCELLED, EventStatus.COMPLETED] },
+        } },
       },
       data: decision === 'approve'
         ? { status: RegistrationStatus.APPROVED, approvedAt: decidedAt, declinedAt: null }
@@ -597,6 +643,16 @@ export async function decideEventRegistration(
       ? await issueEligibleRegistrationTickets(transaction, registration.id, eventId)
       : [];
 
+    await writeAudit(transaction, ownerId, eventId, decision === 'approve' ? 'RSVP_APPROVED' : 'RSVP_REJECTED', {
+      registrationId: registration.id,
+    });
+    if (issuedTickets.length > 0) {
+      await writeAudit(transaction, ownerId, eventId, 'TICKETS_ISSUED', {
+        registrationId: registration.id,
+        ticketCount: issuedTickets.length,
+      });
+    }
+
     const primary = registration.attendees[0];
     const notificationType = decision === 'approve' ? NotificationType.GUEST_RSVP_APPROVED : NotificationType.GUEST_RSVP_DECLINED;
     if (primary?.email) {
@@ -618,6 +674,9 @@ export async function decideEventRegistration(
     return { registration: updatedRegistration, tickets: issuedTickets };
     }, { maxWait: 10000, timeout: 30000 });
   } catch (error) {
+    if (error instanceof HttpError) {
+      throw error;
+    }
     const diagnostic = error instanceof Prisma.PrismaClientKnownRequestError
       ? { errorType: error.name, code: error.code }
       : error instanceof Prisma.PrismaClientUnknownRequestError

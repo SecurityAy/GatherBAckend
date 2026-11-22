@@ -101,7 +101,7 @@ export function deviceRegistrationFilter(eventId: string, lookupHashes: string[]
 }
 
 export function setDeviceCookie(res: Response, deviceId: string) {
-  const secure = process.env.NODE_ENV === 'production';
+  const secure = env.nodeEnv === 'production';
   res.cookie(DEVICE_COOKIE_NAME, signDeviceCookie(deviceId), {
     httpOnly: true,
     sameSite: secure ? 'none' : 'lax',

@@ -1,4 +1,4 @@
-import { EventStatus, Prisma } from '@prisma/client';
+import { AttendanceIntent, AttendeeType, EventStatus, Prisma, RegistrationStatus, TicketStatus } from '@prisma/client';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
 import { HttpError } from '../../middleware/errorHandler.js';
@@ -97,6 +97,7 @@ type CreateEventInput = z.infer<typeof createEventSchema>;
 type UpdateEventInput = z.infer<typeof updateEventSchema>;
 
 const registrationSummarySelect = {
+  id: true,
   eventId: true,
   status: true,
   attendanceIntent: true,
@@ -127,11 +128,75 @@ function isTerminal(eventStatus: EventStatus) {
   return eventStatus === EventStatus.CANCELLED || eventStatus === EventStatus.COMPLETED;
 }
 
+type SelectedEvent = Prisma.EventGetPayload<{ select: typeof eventSelect }>;
+
+async function writeAudit(
+  writer: Pick<Prisma.TransactionClient, 'auditLog'>,
+  actorId: string,
+  eventId: string,
+  action: string,
+  details?: Record<string, unknown>,
+) {
+  await writer.auditLog.create({
+    data: {
+      actorId,
+      eventId,
+      action,
+      ...(details === undefined ? {} : { details: JSON.stringify(details) }),
+    },
+  });
+}
+
+async function transitionEvent(
+  eventId: string,
+  userId: string,
+  options: {
+    allowedFrom: EventStatus[];
+    nextStatus: EventStatus;
+    conflictMessage: string;
+    action: string;
+    data: Prisma.EventUpdateInput;
+    validate?: (event: SelectedEvent) => void;
+    beforeUpdate?: (transaction: Prisma.TransactionClient, event: SelectedEvent) => Promise<void>;
+    auditDetails?: Record<string, unknown>;
+  },
+) {
+  return prisma.$transaction(async (transaction) => {
+    await lockEventCapacity(transaction, eventId);
+    const current = await transaction.event.findFirst({
+      where: { id: eventId, userId, deletedAt: null },
+      select: eventSelect,
+    });
+    if (!current) throw new HttpError(404, 'Event not found.');
+    ensureModifiable(current.eventStatus);
+    if (!options.allowedFrom.includes(current.eventStatus)) {
+      throw new HttpError(409, options.conflictMessage);
+    }
+    options.validate?.(current);
+    await options.beforeUpdate?.(transaction, current);
+
+    const changed = await transaction.event.updateMany({
+      where: { id: eventId, userId, deletedAt: null, eventStatus: { in: options.allowedFrom } },
+      data: { ...options.data, eventStatus: options.nextStatus },
+    });
+    if (changed.count !== 1) {
+      throw new HttpError(409, options.conflictMessage);
+    }
+
+    const updated = await transaction.event.findFirstOrThrow({
+      where: { id: eventId, userId, deletedAt: null },
+      select: eventSelect,
+    });
+    await writeAudit(transaction, userId, eventId, options.action, options.auditDetails);
+    return updated;
+  }, { maxWait: 10000, timeout: 30000 });
+}
+
 function toDashboardCounts(registrations: Array<{
   status: string;
   attendanceIntent: string;
   _count: { attendees: number };
-}>) {
+}>, checkedInCount = 0) {
   return {
     registrationCount: registrations.length,
     pendingRegistrationCount: registrations.filter((item) => item.status === 'PENDING').length,
@@ -141,7 +206,38 @@ function toDashboardCounts(registrations: Array<{
     reservedGuestCount: registrations
       .filter((item) => (item.status === 'PENDING' || item.status === 'APPROVED') && item.attendanceIntent === 'ATTENDING')
       .reduce((total, item) => total + item._count.attendees, 0),
+    checkedInCount,
   };
+}
+
+async function getCheckedInCounts(
+  registrations: Array<{ id: string; eventId: string }>,
+  eventIds: string[],
+) {
+  if (eventIds.length === 0) {
+    return new Map<string, number>();
+  }
+
+  // A check-in belongs to a ticket, which belongs to an attendee, which belongs to
+  // a registration. Group at the attendee level and map through the registrations
+  // already loaded for the dashboard instead of scanning tickets once per event.
+  const groups = await prisma.attendee.groupBy({
+    by: ['registrationId'],
+    where: {
+      registration: { eventId: { in: eventIds } },
+      ticket: { attendance: { isNot: null } },
+    },
+    _count: { _all: true },
+  });
+  const eventByRegistration = new Map(registrations.map((item) => [item.id, item.eventId]));
+  const counts = new Map<string, number>();
+  for (const group of groups) {
+    const eventId = eventByRegistration.get(group.registrationId);
+    if (eventId) {
+      counts.set(eventId, (counts.get(eventId) ?? 0) + group._count._all);
+    }
+  }
+  return counts;
 }
 
 async function getDashboardCounts(eventIds: string[]) {
@@ -153,6 +249,7 @@ async function getDashboardCounts(eventIds: string[]) {
     where: { eventId: { in: eventIds } },
     select: registrationSummarySelect,
   });
+  const checkedInCounts = await getCheckedInCounts(registrations, eventIds);
   const grouped = new Map<string, typeof registrations>();
 
   for (const registration of registrations) {
@@ -161,7 +258,10 @@ async function getDashboardCounts(eventIds: string[]) {
     grouped.set(registration.eventId, items);
   }
 
-  return new Map(eventIds.map((eventId) => [eventId, toDashboardCounts(grouped.get(eventId) ?? [])]));
+  return new Map(eventIds.map((eventId) => [
+    eventId,
+    toDashboardCounts(grouped.get(eventId) ?? [], checkedInCounts.get(eventId) ?? 0),
+  ]));
 }
 
 export async function listEventsByUser(userId: string, page: number, pageSize: number) {
@@ -206,15 +306,19 @@ export async function createEvent(userId: string, input: unknown) {
     const candidateSlug = attempt === 0 ? baseSlug : `${baseSlug}-${attempt + 1}`;
 
     try {
-      const event = await prisma.event.create({
-        data: {
-          ...eventData,
-          slug: candidateSlug,
-          userId,
-          eventStatus: EventStatus.DRAFT,
-          publishedAt: null,
-        },
-        select: eventSelect,
+      const event = await prisma.$transaction(async (transaction) => {
+        const created = await transaction.event.create({
+          data: {
+            ...eventData,
+            slug: candidateSlug,
+            userId,
+            eventStatus: EventStatus.DRAFT,
+            publishedAt: null,
+          },
+          select: eventSelect,
+        });
+        await writeAudit(transaction, userId, created.id, 'EVENT_CREATED');
+        return created;
       });
       return { ...event, ...capacitySummary(event.maxGuestCapacity, 0) };
     } catch (error) {
@@ -242,7 +346,8 @@ export async function getEventById(id: string, userId: string) {
     select: registrationSummarySelect,
   });
 
-  const counts = toDashboardCounts(registrations);
+  const checkedInCounts = await getCheckedInCounts(registrations, [event.id]);
+  const counts = toDashboardCounts(registrations, checkedInCounts.get(event.id) ?? 0);
   const { reservedGuestCount, ...dashboardCounts } = counts;
   return {
     ...event,
@@ -288,6 +393,21 @@ export async function getPublicEventBySlug(slug: string, device?: DeviceContext)
   };
 }
 
+async function maxReservedAdditionalGuests(
+  reader: Pick<Prisma.TransactionClient, 'rSVPRegistration'>,
+  eventId: string,
+) {
+  const registrations = await reader.rSVPRegistration.findMany({
+    where: {
+      eventId,
+      status: { in: [RegistrationStatus.PENDING, RegistrationStatus.APPROVED] },
+      attendanceIntent: AttendanceIntent.ATTENDING,
+    },
+    select: { attendees: { where: { attendeeType: AttendeeType.ADDITIONAL }, select: { id: true } } },
+  });
+  return registrations.reduce((maximum, registration) => Math.max(maximum, registration.attendees.length), 0);
+}
+
 export async function updateEvent(id: string, userId: string, input: unknown) {
   const payload: UpdateEventInput = updateEventSchema.parse(input);
   const event = await findOwnedEvent(id, userId);
@@ -312,6 +432,13 @@ export async function updateEvent(id: string, userId: string, input: unknown) {
       throw new HttpError(409, `Capacity cannot be lower than the ${reservedGuestCount} guest spaces already reserved.`);
     }
 
+    if (payload.additionalGuestLimit !== undefined && payload.additionalGuestLimit !== null) {
+      const maxReservedGuests = await maxReservedAdditionalGuests(transaction, event.id);
+      if (payload.additionalGuestLimit < maxReservedGuests) {
+        throw new HttpError(409, `Additional guest limit cannot be lower than the ${maxReservedGuests} guests already reserved.`);
+      }
+    }
+
     const updated = await transaction.event.update({
       where: { id: event.id },
       data: candidateSlug === undefined
@@ -319,6 +446,16 @@ export async function updateEvent(id: string, userId: string, input: unknown) {
         : { ...eventData, slug: candidateSlug },
       select: eventSelect,
     });
+    const scheduleFieldsTouched = ['eventDate', 'timezone', 'rsvpDeadline']
+      .some((field) => Object.prototype.hasOwnProperty.call(payload, field));
+    if (scheduleFieldsTouched && updated.eventStatus === EventStatus.PUBLISHED) {
+      assertPublishedSchedule(updated);
+    }
+    const changedFields = [...new Set([
+      ...Object.keys(payload),
+      ...(candidateSlug === undefined ? [] : ['slug']),
+    ])];
+    await writeAudit(transaction, userId, event.id, 'EVENT_UPDATED', { changedFields });
     return { ...updated, ...capacitySummary(updated.maxGuestCapacity, reservedGuestCount) };
   }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 10000, timeout: 15000 });
 
@@ -338,23 +475,14 @@ export async function updateEvent(id: string, userId: string, input: unknown) {
   throw new HttpError(409, 'Could not generate a unique event URL. Please try again.');
 }
 
-export async function publishEvent(id: string, userId: string) {
-  const event = await findOwnedEvent(id, userId);
-  ensureModifiable(event.eventStatus);
-
-  if (event.eventStatus !== EventStatus.DRAFT && event.eventStatus !== EventStatus.UNPUBLISHED) {
-    throw new HttpError(409, 'Only draft or unpublished events can be published.');
-  }
-
-  const missingFields = [
-    ['graduateName', event.graduateName],
+function assertPublishedSchedule(event: SelectedEvent) {
+  const missingScheduleFields = [
     ['eventDate', event.eventDate],
     ['timezone', event.timezone],
-    ['venueName', event.venueName],
+    ['rsvpDeadline', event.rsvpDeadline],
   ].filter(([, value]) => value === null || value === undefined || value === '').map(([field]) => field);
-
-  if (missingFields.length > 0) {
-    throw new HttpError(400, `Complete required event details before publishing: ${missingFields.join(', ')}.`);
+  if (missingScheduleFields.length > 0) {
+    throw new HttpError(400, `Published events must keep a valid schedule: ${missingScheduleFields.join(', ')}.`);
   }
 
   try {
@@ -363,36 +491,119 @@ export async function publishEvent(id: string, userId: string) {
     throw new HttpError(400, 'Event timezone must be a valid IANA timezone.');
   }
 
-  return prisma.event.update({
-    where: { id: event.id },
-    data: { eventStatus: EventStatus.PUBLISHED, publishedAt: new Date() },
-    select: eventSelect,
+  const now = new Date();
+  if (event.eventDate! <= now) {
+    throw new HttpError(400, 'Event date must be in the future before publishing.');
+  }
+  if (event.rsvpDeadline! <= now) {
+    throw new HttpError(400, 'RSVP deadline must be in the future before publishing.');
+  }
+  if (event.rsvpDeadline! >= event.eventDate!) {
+    throw new HttpError(400, 'RSVP deadline must be before the event date.');
+  }
+}
+
+function assertPublishable(event: SelectedEvent) {
+  const missingFields = [
+    ['graduateName', event.graduateName],
+    ['eventDate', event.eventDate],
+    ['timezone', event.timezone],
+    ['venueName', event.venueName],
+    ['rsvpDeadline', event.rsvpDeadline],
+  ].filter(([, value]) => value === null || value === undefined || value === '').map(([field]) => field);
+
+  if (missingFields.length > 0) {
+    throw new HttpError(400, `Complete required event details before publishing: ${missingFields.join(', ')}.`);
+  }
+
+  assertPublishedSchedule(event);
+}
+
+export async function publishEvent(id: string, userId: string) {
+  return transitionEvent(id, userId, {
+    allowedFrom: [EventStatus.DRAFT, EventStatus.UNPUBLISHED],
+    nextStatus: EventStatus.PUBLISHED,
+    conflictMessage: 'Only draft or unpublished events can be published.',
+    action: 'EVENT_PUBLISHED',
+    data: { publishedAt: new Date() },
+    validate: assertPublishable,
   });
 }
 
 export async function unpublishEvent(id: string, userId: string) {
-  const event = await findOwnedEvent(id, userId);
-  ensureModifiable(event.eventStatus);
+  return transitionEvent(id, userId, {
+    allowedFrom: [EventStatus.PUBLISHED],
+    nextStatus: EventStatus.UNPUBLISHED,
+    conflictMessage: 'Only published events can be unpublished.',
+    action: 'EVENT_UNPUBLISHED',
+    data: {},
+  });
+}
 
-  if (event.eventStatus !== EventStatus.PUBLISHED) {
-    throw new HttpError(409, 'Only published events can be unpublished.');
-  }
+export async function cancelEvent(id: string, userId: string) {
+  const cancelledAt = new Date();
+  return transitionEvent(id, userId, {
+    allowedFrom: [EventStatus.DRAFT, EventStatus.PUBLISHED, EventStatus.UNPUBLISHED],
+    nextStatus: EventStatus.CANCELLED,
+    conflictMessage: 'Only non-terminal events can be cancelled.',
+    action: 'EVENT_CANCELLED',
+    data: {},
+    auditDetails: { cancelledAt: cancelledAt.toISOString() },
+    beforeUpdate: async (transaction, current) => {
+      await transaction.rSVPRegistration.updateMany({
+        where: {
+          eventId: current.id,
+          status: { in: [RegistrationStatus.PENDING, RegistrationStatus.APPROVED] },
+        },
+        data: { status: RegistrationStatus.CANCELLED, cancelledAt },
+      });
+      // Checked-in tickets remain USED; only active tickets can be voided.
+      await transaction.ticket.updateMany({
+        where: {
+          attendee: { registration: { eventId: current.id } },
+          ticketStatus: TicketStatus.ISSUED,
+        },
+        data: { ticketStatus: TicketStatus.VOID },
+      });
+    },
+  });
+}
 
-  return prisma.event.update({
-    where: { id: event.id },
-    data: { eventStatus: EventStatus.UNPUBLISHED },
-    select: eventSelect,
+export async function completeEvent(id: string, userId: string) {
+  return transitionEvent(id, userId, {
+    allowedFrom: [EventStatus.PUBLISHED],
+    nextStatus: EventStatus.COMPLETED,
+    conflictMessage: 'Only published events can be completed.',
+    action: 'EVENT_COMPLETED',
+    data: {},
   });
 }
 
 export async function softDeleteEvent(id: string, userId: string) {
-  const event = await findOwnedEvent(id, userId);
+  return prisma.$transaction(async (transaction) => {
+    await lockEventCapacity(transaction, id);
+    const current = await transaction.event.findFirst({
+      where: { id, userId, deletedAt: null },
+      select: eventSelect,
+    });
+    if (!current) throw new HttpError(404, 'Event not found.');
 
-  return prisma.event.update({
-    where: { id: event.id },
-    data: { deletedAt: new Date() },
-    select: eventSelect,
-  });
+    const deletedAt = new Date();
+    const changed = await transaction.event.updateMany({
+      where: { id, userId, deletedAt: null },
+      data: { deletedAt },
+    });
+    if (changed.count !== 1) {
+      throw new HttpError(409, 'Event is no longer available.');
+    }
+
+    const updated = await transaction.event.findFirstOrThrow({
+      where: { id, userId },
+      select: eventSelect,
+    });
+    await writeAudit(transaction, userId, id, 'EVENT_DELETED', { deletedAt: deletedAt.toISOString() });
+    return updated;
+  }, { maxWait: 10000, timeout: 30000 });
 }
 
 async function findOwnedEvent(id: string, userId: string) {

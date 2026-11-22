@@ -39,6 +39,8 @@ export async function createEventImageUploadSignature(eventIdInput: string, user
   const timestamp = Math.floor(Date.now() / 1000);
   const folder = `gather/events/${event.id}`;
   const publicId = randomUUID();
+  // Cloudinary has no signed `file_size_limit` upload parameter. The size below is an
+  // advisory client hint only; the account-level Cloudinary upload cap is the hard limit.
   const signedParameters = {
     allowed_formats: allowedFormats,
     folder,
@@ -47,6 +49,15 @@ export async function createEventImageUploadSignature(eventIdInput: string, user
     timestamp,
   };
   const signature = createSignature(signedParameters, cloudinary.apiSecret);
+
+  await prisma.auditLog.create({
+    data: {
+      actorId: userId,
+      eventId: event.id,
+      action: 'IMAGE_UPLOAD_SIGNED',
+      details: JSON.stringify({ publicId }),
+    },
+  });
 
   return {
     cloud_name: cloudinary.cloudName,

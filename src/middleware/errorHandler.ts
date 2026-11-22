@@ -17,7 +17,7 @@ export function notFoundHandler(_req: Request, res: Response) {
   res.status(404).json({ message: 'Route not found.' });
 }
 
-export function errorHandler(error: Error, _req: Request, res: Response, _next: NextFunction) {
+export function errorHandler(error: Error, req: Request, res: Response, _next: NextFunction) {
   if (error instanceof HttpError) {
     return res.status(error.statusCode).json({ message: error.message });
   }
@@ -33,6 +33,10 @@ export function errorHandler(error: Error, _req: Request, res: Response, _next: 
     return res.status(409).json({ message: 'A record with this value already exists.' });
   }
 
-  console.error('Request failed:', { name: error.name });
+  console.error('Request failed:', {
+    requestId: req.requestId ?? '-',
+    name: error.name,
+    ...(error instanceof Prisma.PrismaClientKnownRequestError ? { code: error.code } : {}),
+  });
   return res.status(500).json({ message: 'Unexpected server error.' });
 }
