@@ -624,3 +624,41 @@ function ensureModifiable(eventStatus: EventStatus) {
     throw new HttpError(409, 'Cancelled or completed events cannot be modified.');
   }
 }
+
+/** Read-only, owner-scoped audit view. `details` is returned exactly as stored. */
+export async function listEventAudit(
+  eventId: string,
+  ownerId: string,
+  page: number,
+  pageSize: number,
+) {
+  const event = await prisma.event.findFirst({
+    where: { id: eventId, userId: ownerId, deletedAt: null },
+    select: { id: true },
+  });
+  if (!event) throw new HttpError(404, 'Event not found.');
+
+  const where = { eventId };
+  const [entries, total] = await prisma.$transaction([
+    prisma.auditLog.findMany({
+      where,
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      skip: (page - 1) * pageSize,
+      take: pageSize,
+      select: {
+        id: true,
+        action: true,
+        actorId: true,
+        eventId: true,
+        details: true,
+        createdAt: true,
+      },
+    }),
+    prisma.auditLog.count({ where }),
+  ]);
+
+  return {
+    entries,
+    pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) },
+  };
+}

@@ -57,7 +57,8 @@ Authenticated organiser endpoints:
 - `GET /api/events/:eventId/rsvps/:registrationId`
 - `POST /api/events/:eventId/rsvps/:registrationId/approve`
 - `POST /api/events/:eventId/rsvps/:registrationId/reject`
-- All four routes require a bearer access token. The RSVP list/detail and decision routes return `404` for an event or registration the authenticated organiser cannot access.
+- `POST /api/events/:eventId/rsvps/bulk-approve` and `POST /api/events/:eventId/rsvps/bulk-decline` accept `{ "registrationIds": ["<uuid>", ...] }` (1–100 ids). They apply the single-registration decision path once per id in its own transaction and return `{ "results": [{ "registrationId", "ok", "status"?, "tickets"?, "error"? }] }`. One failure does not roll back the rest of the batch, and capacity is rechecked for every approval. Bulk-approve responses contain raw QR tokens and use `Cache-Control: no-store`.
+- All routes above require a bearer access token. The RSVP list/detail and decision routes return `404` for an event or registration the authenticated organiser cannot access.
 - The list response includes pagination metadata. Approval and rejection endpoints accept an empty body only and return `200` with the updated registration and attendee details. The response shape is:
 
 ```json
@@ -121,7 +122,7 @@ Authenticated event-owner endpoints:
 - `GET /api/events/:eventId/attendees?page=1&pageSize=50` returns `{ attendees, pagination }`. Each attendee contains `id`, `firstName`, `lastName`, `attendeeType`, `attendanceIntent`, `registrationStatus`, `hasTicket`, `ticketStatus` (`ISSUED`, `USED`, `VOID`, or `null`), `checkedIn`, and `checkedInAt`. QR tokens and hashes are never included. Page size is 1–100.
 - `GET /api/events/:eventId/tickets?page=1&pageSize=50` returns `{ tickets, pagination }`. Each ticket contains `id`, `attendeeId`, `attendeeName`, `ticketStatus`, `revoked` (true for `VOID`), `issuedAt`, `usedAt`, and `checkedInAt`. Tokens and hashes are never included.
 - `POST /api/events/:eventId/tickets/:ticketId/reissue` and `POST /api/events/:eventId/tickets/:ticketId/revoke` are additive ticket-id variants of the attendee routes above; reissue returns the raw token with `Cache-Control: no-store`.
-- `GET /api/events/:eventId/attendees`, `GET /api/events/:eventId/rsvps`, and `GET /api/events/:eventId/tickets` return a content-derived `ETag` plus `Cache-Control: private, max-age=0, must-revalidate`. Clients can poll with `If-None-Match`; unchanged lists return `304` with an empty body. ETags are hashed from the public response bodies only.
+- `GET /api/events/:eventId/attendees`, `GET /api/events/:eventId/rsvps`, `GET /api/events/:eventId/tickets`, and `GET /api/events/:eventId/audit` return a content-derived `ETag` plus `Cache-Control: private, max-age=0, must-revalidate`. Clients can poll with `If-None-Match`; unchanged lists return `304` with an empty body. ETags are hashed from the public response bodies only.
 
 Ticket status meanings:
 
@@ -159,7 +160,7 @@ All transitions re-check the status under the event advisory lock and use a cond
 
 - `GET /health` is a static liveness probe. `GET /health/ready` checks database connectivity and returns `503` when the database is unreachable.
 - Every response carries `X-Request-Id`; clients may supply a validated `X-Request-Id` header for correlation. Request logs include the ID and redact token-like query parameters and ticket path segments.
-- Sensitive organizer actions are recorded in `AuditLog` with actor, event, action, timestamp, and safe metadata only: event create/update/publish/unpublish/cancel/complete/delete, RSVP decisions and cancellations, ticket issue/reissue/revoke/check-in, and upload signing. Raw QR and confirmation tokens are never written to audit records, and no ordinary route exposes or edits audit logs.
+- Sensitive organizer actions are recorded in `AuditLog` with actor, event, action, timestamp, and safe metadata only: event create/update/publish/unpublish/cancel/complete/delete, RSVP decisions and cancellations, ticket issue/reissue/revoke/check-in, and upload signing. Raw QR and confirmation tokens are never written to audit records. `GET /api/events/:eventId/audit?page=1&pageSize=20` is a read-only, owner-scoped view (`pageSize` max 100) that returns `entries` and `pagination` with `details` exactly as stored; audit rows cannot be edited through the API.
 - `npm test` and `npm run test:safe` run the safe suite; CI runs typechecking, whitespace checks, and the safe suite. `npm run test:direct` bypasses the database guard and should only be used deliberately.
 
 ## Notes

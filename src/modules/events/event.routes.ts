@@ -11,6 +11,7 @@ import {
   createEvent,
   getEventById,
   getPublicEventBySlug,
+  listEventAudit,
   listEventsByUser,
   publishEvent,
   softDeleteEvent,
@@ -18,6 +19,7 @@ import {
   updateEvent,
 } from './event.service.js';
 import {
+  bulkDecideEventRegistrations,
   cancelEventRegistration,
   cancelRsvpByToken,
   getEventRegistration,
@@ -46,6 +48,9 @@ const limitUploadSigning = createRateLimiter({
 });
 const limitTicketMutation = createRateLimiter({
   maxRequests: 30, windowMs: 15 * 60 * 1000, keyPrefix: 'ticket-mutation', keySelector: (req) => req.user?.id,
+});
+const limitBulkDecision = createRateLimiter({
+  maxRequests: 30, windowMs: 15 * 60 * 1000, keyPrefix: 'bulk-decision', keySelector: (req) => req.user?.id,
 });
 
 const paginationSchema = z.object({
@@ -194,7 +199,29 @@ const decideRsvp = (decision: 'approve' | 'reject') => async (
   }
 };
 
+const bulkDecideRsvps = (decision: 'approve' | 'reject') => async (
+  req: Request<{ eventId: string }>,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const result = await bulkDecideEventRegistrations(
+      req.params.eventId,
+      req.user!.id,
+      decision,
+      req.body,
+    );
+    // Approval results contain raw QR tokens; never allow them to be cached.
+    if (decision === 'approve') res.setHeader('Cache-Control', 'no-store');
+    res.status(200).json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
 eventRouter.get('/:eventId/rsvps', listRsvps);
+eventRouter.post('/:eventId/rsvps/bulk-approve', limitBulkDecision, bulkDecideRsvps('approve'));
+eventRouter.post('/:eventId/rsvps/bulk-decline', limitBulkDecision, bulkDecideRsvps('reject'));
 eventRouter.get('/:eventId/rsvps/:registrationId', getRsvp);
 eventRouter.post('/:eventId/rsvps/:registrationId/approve', decideRsvp('approve'));
 eventRouter.post('/:eventId/rsvps/:registrationId/reject', decideRsvp('reject'));
@@ -298,6 +325,16 @@ eventRouter.get('/:eventId/tickets', async (req: Request<{ eventId: string }>, r
   try {
     const pagination = attendeePaginationSchema.parse(req.query);
     const result = await listEventTickets(req.params.eventId, req.user!.id, pagination.page, pagination.pageSize);
+    sendWithEtag(req, res, result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+eventRouter.get('/:eventId/audit', async (req: Request<{ eventId: string }>, res, next) => {
+  try {
+    const pagination = paginationSchema.parse(req.query);
+    const result = await listEventAudit(req.params.eventId, req.user!.id, pagination.page, pagination.pageSize);
     sendWithEtag(req, res, result);
   } catch (error) {
     next(error);

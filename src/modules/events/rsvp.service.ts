@@ -692,6 +692,45 @@ export async function decideEventRegistration(
   }
 }
 
+const bulkDecisionSchema = z.object({
+  registrationIds: z.array(z.string().uuid()).min(1).max(100),
+}).strict();
+
 export function parseRegistrationPagination(input: unknown) {
   return paginationSchema.parse(input);
+}
+
+/**
+ * Applies the single-registration decision service once per id so one bad id cannot
+ * roll back the rest of the batch. Each call still uses its own advisory-lock
+ * transaction, preserving the capacity checks of the single endpoints.
+ */
+export async function bulkDecideEventRegistrations(
+  eventId: string,
+  ownerId: string,
+  decision: 'approve' | 'reject',
+  input: unknown,
+) {
+  const { registrationIds } = bulkDecisionSchema.parse(input);
+  const results: Array<{
+    registrationId: string;
+    ok: boolean;
+    status?: RegistrationStatus;
+    tickets?: Array<{ attendeeId: string; ticketId: string; qrToken: string }>;
+    error?: string;
+  }> = [];
+
+  for (const registrationId of registrationIds) {
+    try {
+      const result = await decideEventRegistration(eventId, registrationId, ownerId, decision);
+      results.push(decision === 'approve'
+        ? { registrationId, ok: true, status: result.registration.status, tickets: result.tickets }
+        : { registrationId, ok: true, status: result.registration.status });
+    } catch (error) {
+      const message = error instanceof HttpError ? error.message : 'Registration could not be processed.';
+      results.push({ registrationId, ok: false, error: message.slice(0, 200) });
+    }
+  }
+
+  return { results };
 }

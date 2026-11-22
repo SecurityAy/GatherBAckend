@@ -52,9 +52,13 @@ Terminal events (`CANCELLED`, `COMPLETED`) reject edits, further transitions, an
 | `GET /events/:eventId/rsvps/:registrationId` | — | Registration and attendee details. |
 | `POST /events/:eventId/rsvps/:registrationId/approve` | Empty | `200` with registration and newly issued tickets. |
 | `POST /events/:eventId/rsvps/:registrationId/reject` | Empty | `200` with registration and an empty tickets array. |
+| `POST /events/:eventId/rsvps/bulk-approve` | `{ registrationIds: string[] }` (1–100 UUIDs) | `200` with `{ results: [{ registrationId, ok, status?, tickets?, error? }] }`; token-bearing response uses `Cache-Control: no-store`. |
+| `POST /events/:eventId/rsvps/bulk-decline` | `{ registrationIds: string[] }` (1–100 UUIDs) | `200` with `{ results: [{ registrationId, ok, status?, error? }] }`. |
 | `POST /events/:eventId/rsvps/:registrationId/cancel` | Empty | `200` with cancellation and voided-ticket count. |
 
 Only `PENDING` registrations can be approved or rejected. Approval requires `ATTENDING`. Foreign or missing registrations return `404`; invalid state transitions return `409`.
+
+Bulk actions apply the same single-registration decision service once per id in a separate transaction, so a bad id does not roll back the batch. Each result reports `ok`, the resulting `status` when successful, and either `tickets` (approve only) or a short `error`. Capacity is rechecked per registration; later approvals fail explicitly if the event fills mid-batch.
 
 ## Ticket routes
 
@@ -62,6 +66,7 @@ Only `PENDING` registrations can be approved or rejected. Approval requires `ATT
 |---|---|---|
 | `GET /events/:eventId/attendees` | Bearer, owner | Paginated safe attendee rows including `ticketStatus`, `checkedIn`, and `checkedInAt`; never tokens. |
 | `GET /events/:eventId/tickets` | Bearer, owner | Paginated safe ticket rows including `ticketStatus`, `revoked`, `checkedInAt`, and `attendeeName`; never tokens. |
+| `GET /events/:eventId/audit` | Bearer, owner | `page`, `pageSize`; `{ entries: [{ id, action, actorId, eventId, details, createdAt }], pagination }`, newest first. |
 | `GET /events/:eventId/rsvps` | Bearer, owner | Paginated registrations. |
 | `POST /events/:eventId/tickets/issue` | Bearer, owner | Issues missing eligible tickets; new raw `qrToken` values are returned only here. |
 | `POST /events/:eventId/attendees/:attendeeId/tickets/reissue` | Bearer, owner | Rotates the token; the old token stops working immediately. |
@@ -73,7 +78,7 @@ Only `PENDING` registrations can be approved or rejected. Approval requires `ATT
 
 `ticketStatus` values: `ISSUED` (active), `USED` (checked in), `VOID` (cancelled/revoked). Check-in, reissue, and revocation are serialized by a per-event advisory lock and write `AuditLog` records without raw tokens.
 
-`GET /events/:eventId/attendees`, `GET /events/:eventId/rsvps`, and `GET /events/:eventId/tickets` return a content-derived `ETag` and `Cache-Control: private, max-age=0, must-revalidate`. Clients may poll with `If-None-Match`; an unchanged list returns `304 Not Modified` with an empty body. ETags are hashes of the public response bodies only and never contain tokens.
+`GET /events/:eventId/attendees`, `GET /events/:eventId/rsvps`, `GET /events/:eventId/tickets`, and `GET /events/:eventId/audit` return a content-derived `ETag` and `Cache-Control: private, max-age=0, must-revalidate`. Clients may poll with `If-None-Match`; an unchanged list returns `304 Not Modified` with an empty body. ETags are hashes of the public response bodies only and never contain tokens.
 
 ## Health
 

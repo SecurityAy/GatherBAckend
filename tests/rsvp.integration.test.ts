@@ -3089,6 +3089,203 @@ test('event check-in totals, cache validators, and ticket-id operations are addi
   }
 });
 
+test('audit feed and bulk RSVP decisions are owner-scoped, additive, and cache-validated', async () => {
+  const suffix = randomUUID();
+  const userIds: string[] = [];
+  const eventIds: string[] = [];
+  let localServer: ReturnType<typeof app.listen> | undefined;
+
+  try {
+    const owner = await prisma.user.create({
+      data: {
+        firstName: 'Bulk',
+        lastName: 'Owner',
+        email: `bulk-audit-${suffix}-owner@example.test`,
+        passwordHash: 'test-only-hash',
+      },
+    });
+    userIds.push(owner.id);
+    const otherOwner = await prisma.user.create({
+      data: {
+        firstName: 'Foreign',
+        lastName: 'Owner',
+        email: `bulk-audit-${suffix}-foreign@example.test`,
+        passwordHash: 'test-only-hash',
+      },
+    });
+    userIds.push(otherOwner.id);
+
+    const event = await prisma.event.create({
+      data: {
+        userId: owner.id,
+        title: 'Bulk Audit Event',
+        slug: `bulk-audit-${suffix}`,
+        eventCategory: 'Test',
+        eventStatus: EventStatus.PUBLISHED,
+        approvalRequired: true,
+      },
+    });
+    eventIds.push(event.id);
+    const otherEvent = await prisma.event.create({
+      data: {
+        userId: otherOwner.id,
+        title: 'Foreign Bulk Audit Event',
+        slug: `bulk-audit-foreign-${suffix}`,
+        eventCategory: 'Test',
+        eventStatus: EventStatus.PUBLISHED,
+        approvalRequired: true,
+      },
+    });
+    eventIds.push(otherEvent.id);
+
+    async function pendingRegistration(slug: string, emailSuffix: string) {
+      const submission = await submitRsvp(slug, rsvpBody(`bulk-audit-${suffix}-${emailSuffix}@example.test`));
+      const tokenHash = createHash('sha256').update(submission.confirmationToken).digest('hex');
+      return prisma.rSVPRegistration.findUniqueOrThrow({
+        where: { confirmationTokenHash: tokenHash },
+        select: { id: true },
+      });
+    }
+
+    const approveA = await pendingRegistration(event.slug, 'approve-a');
+    const approveB = await pendingRegistration(event.slug, 'approve-b');
+    const decline = await pendingRegistration(event.slug, 'decline');
+    const foreign = await pendingRegistration(otherEvent.slug, 'foreign');
+
+    localServer = app.listen(0);
+    await new Promise<void>((resolve, reject) => {
+      localServer!.once('listening', resolve);
+      localServer!.once('error', reject);
+    });
+    server = localServer;
+
+    const ownerHeaders = { Authorization: `Bearer ${accessToken(owner.id)}` };
+    const jsonHeaders = { ...ownerHeaders, 'Content-Type': 'application/json' };
+    const foreignHeaders = { Authorization: `Bearer ${accessToken(otherOwner.id)}` };
+
+    assert.equal((await request(`/api/events/${event.id}/audit`)).status, 401);
+    assert.equal((await request(`/api/events/${event.id}/audit`, { headers: foreignHeaders })).status, 404);
+
+    const bulkApprove = await request(`/api/events/${event.id}/rsvps/bulk-approve`, {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify({ registrationIds: [approveA.id, approveB.id, foreign.id, randomUUID()] }),
+    });
+    assert.equal(bulkApprove.status, 200);
+    assert.equal(bulkApprove.headers.get('cache-control'), 'no-store');
+    const approvedResults = (await bulkApprove.json()) as {
+      results: Array<{
+        registrationId: string;
+        ok: boolean;
+        status?: RegistrationStatus;
+        tickets?: Array<{ attendeeId: string; ticketId: string; qrToken: string }>;
+        error?: string;
+      }>;
+    };
+    assert.equal(approvedResults.results.length, 4);
+    for (const result of approvedResults.results.slice(0, 2)) {
+      assert.equal(result.ok, true);
+      assert.equal(result.status, RegistrationStatus.APPROVED);
+      assert.equal(result.tickets?.length, 1);
+      assert.equal(result.tickets?.[0].qrToken.length, 43);
+      assert.ok(result.tickets?.[0].ticketId);
+    }
+    assert.equal(approvedResults.results[2].ok, false);
+    assert.match(approvedResults.results[2].error ?? '', /not found/i);
+    assert.equal(approvedResults.results[3].ok, false);
+    assert.match(approvedResults.results[3].error ?? '', /not found/i);
+    assert.equal((await prisma.rSVPRegistration.findUniqueOrThrow({ where: { id: approveA.id } })).status, RegistrationStatus.APPROVED);
+    assert.equal((await prisma.rSVPRegistration.findUniqueOrThrow({ where: { id: approveB.id } })).status, RegistrationStatus.APPROVED);
+    assert.equal(await prisma.ticket.count({ where: { attendee: { registrationId: { in: [approveA.id, approveB.id] } } } }), 2);
+    assert.equal(await prisma.notificationOutbox.count({
+      where: { registrationId: { in: [approveA.id, approveB.id] }, type: NotificationType.GUEST_RSVP_APPROVED },
+    }), 2);
+
+    const bulkDecline = await request(`/api/events/${event.id}/rsvps/bulk-decline`, {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify({ registrationIds: [decline.id, approveA.id] }),
+    });
+    assert.equal(bulkDecline.status, 200);
+    const declinedResults = (await bulkDecline.json()) as {
+      results: Array<{ registrationId: string; ok: boolean; status?: RegistrationStatus; error?: string }>;
+    };
+    assert.equal(declinedResults.results.length, 2);
+    assert.equal(declinedResults.results[0].ok, true);
+    assert.equal(declinedResults.results[0].status, RegistrationStatus.DECLINED);
+    assert.equal(declinedResults.results[1].ok, false);
+    assert.match(declinedResults.results[1].error ?? '', /pending/i);
+    assert.equal(await prisma.notificationOutbox.count({
+      where: { registrationId: decline.id, type: NotificationType.GUEST_RSVP_DECLINED },
+    }), 1);
+
+    const badBulk = await request(`/api/events/${event.id}/rsvps/bulk-approve`, {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify({ registrationIds: [] }),
+    });
+    assert.equal(badBulk.status, 400);
+    const nonUuidBulk = await request(`/api/events/${event.id}/rsvps/bulk-approve`, {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify({ registrationIds: ['not-a-uuid'] }),
+    });
+    assert.equal(nonUuidBulk.status, 400);
+
+    const audit = await request(`/api/events/${event.id}/audit?page=1&pageSize=50`, { headers: ownerHeaders });
+    assert.equal(audit.status, 200);
+    const etag = audit.headers.get('etag');
+    assert.ok(etag);
+    assert.match(audit.headers.get('cache-control') ?? '', /must-revalidate/);
+    const auditBody = await audit.json() as {
+      entries: Array<{ id: string; action: string; actorId: string | null; eventId: string; details: string | null; createdAt: string }>;
+      pagination: { page: number; pageSize: number; total: number; totalPages: number };
+    };
+    // Two approvals each add a TICKETS_ISSUED row in addition to their decision rows.
+    assert.equal(auditBody.entries.length, 5);
+    assert.ok(auditBody.entries.every((entry) => entry.eventId === event.id));
+    assert.equal(auditBody.entries.filter((entry) => entry.action === 'RSVP_APPROVED').length, 2);
+    assert.equal(auditBody.entries.filter((entry) => entry.action === 'TICKETS_ISSUED').length, 2);
+    assert.equal(auditBody.entries.filter((entry) => entry.action === 'RSVP_REJECTED').length, 1);
+    assert.equal(auditBody.pagination.total, 5);
+    assert.ok(auditBody.entries.every((entry) => entry.actorId === owner.id));
+    assert.ok(auditBody.entries.every((entry) => Boolean(entry.createdAt)));
+    assert.doesNotMatch(JSON.stringify(auditBody), /qrToken|passwordHash/);
+
+    const audit304 = await request(`/api/events/${event.id}/audit?page=1&pageSize=50`, {
+      headers: { ...ownerHeaders, 'If-None-Match': etag!, 'Cache-Control': 'max-age=0' },
+    });
+    assert.equal(audit304.status, 304);
+    assert.equal(await audit304.text(), '');
+
+    const auditPage2 = await request(`/api/events/${event.id}/audit?page=2&pageSize=1`, { headers: ownerHeaders });
+    assert.equal(auditPage2.status, 200);
+    const auditPage2Body = await auditPage2.json() as { entries: unknown[]; pagination: { page: number; totalPages: number } };
+    assert.equal(auditPage2Body.entries.length, 1);
+    assert.equal(auditPage2Body.pagination.page, 2);
+    assert.equal(auditPage2Body.pagination.totalPages, 5);
+    assert.equal((await request(`/api/events/${randomUUID()}/audit`, { headers: ownerHeaders })).status, 404);
+  } finally {
+    if (localServer) {
+      await new Promise<void>((resolve, reject) => localServer!.close((error) => error ? reject(error) : resolve()));
+      if (server === localServer) server = undefined;
+    }
+    if (eventIds.length) {
+      const eventFilter = { attendee: { registration: { eventId: { in: eventIds } } } };
+      await prisma.attendanceCheckIn.deleteMany({ where: { ticket: eventFilter } });
+      await prisma.ticket.deleteMany({ where: eventFilter });
+      await prisma.attendee.deleteMany({ where: { registration: { eventId: { in: eventIds } } } });
+      await prisma.notificationOutbox.deleteMany({ where: { registration: { eventId: { in: eventIds } } } });
+      await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.auditLog.deleteMany({ where: { eventId: { in: eventIds } } });
+      await prisma.event.deleteMany({ where: { id: { in: eventIds } } });
+    }
+    if (userIds.length) {
+      await prisma.user.deleteMany({ where: { id: { in: userIds } } });
+    }
+  }
+});
+
 after(async () => {
   await prisma.$disconnect();
 });
