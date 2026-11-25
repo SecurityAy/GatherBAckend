@@ -99,7 +99,7 @@ Upload the image directly from the frontend to Cloudinary using the returned sig
 
 Public rate limits are 5 RSVP submissions per IP per hour and 20 confirmation/cancellation lookups per IP per 15 minutes. Authenticated upload signing and ticket issue/reissue/revoke are limited to 30 requests per user per 15 minutes; check-in is limited to 200 requests per user per 15 minutes so a venue kiosk is not throttled during a normal event. These counters remain process-local. They return `429` with `Retry-After`. The Express app is configured with `app.set('trust proxy', 1)` to trust one upstream reverse proxy (such as Render's default ingress) when resolving client IPs. If additional proxy or CDN layers (such as Cloudflare) are placed in front of the service, adjust the trusted proxy hop count or CIDR configuration accordingly. Counters are in memory, bounded to 10,000 keys, per backend process, and reset when a process restarts; they are not shared across multiple instances. A multi-instance deployment needs a shared store such as Redis.
 
-`npm test` is the safe default: it validates `.env.test.local`, applies migrations to the disposable `gather_rsvp_test` database, and runs the integration suite there. Use `npm run test:direct` only when you intentionally want to run against the current environment. CI runs typechecking, whitespace checks, and the safe suite.
+`npm test` is the safe default: it validates `.env.test.local`, applies migrations to the disposable `gather_rsvp_test` database, and runs the integration suite there. Use `npm run test:direct` only when you intentionally want to run against the current environment. CI always runs typechecking, build, and whitespace checks; it runs the safe suite only when the `TEST_DATABASE_URL` and `TEST_DIRECT_URL` secrets are configured for the disposable `gather_rsvp_test` database, and emits a warning when they are absent.
 
 ## Transactional email notifications
 
@@ -120,12 +120,13 @@ For safe local integration tests, put the disposable Neon test database URLs in 
 
 No migration in this work was applied to production. Apply only after a verified database backup, with the email worker stopped or drained, and with the previous application version ready to redeploy if rollback is needed.
 
-Pending account/delivery migrations, in order:
+Pending account/auth/delivery migrations, in order:
 
 1. `20261122120000_add_account_notification_types` appends `PASSWORD_RESET` and `TICKET_DELIVERY` to the `NotificationType` enum used by `NotificationOutbox.type`.
 2. `20261122121000_add_account_self_service_and_ticket_delivery` creates the `TicketDeliveryStatus` enum; adds `User.passwordResetTokenHash` (`CHAR(64)`, unique index `User_passwordResetTokenHash_key`), `User.passwordResetExpiresAt`, `User.emailNotifications` (default `true`), and `User.locale` (default `en`); makes `NotificationOutbox.registrationId` nullable, adds `userId`, `ticketId`, and `dedupeKey`, adds cascade FKs `NotificationOutbox_userId_fkey` and `NotificationOutbox_ticketId_fkey`, the unique index `NotificationOutbox_dedupeKey_type_key`, and indexes `NotificationOutbox_userId_type_idx` / `NotificationOutbox_ticketId_type_idx` while retaining `NotificationOutbox_registrationId_type_key`; and adds `Ticket.deliveryStatus` (default `NOT_SENT`), `lastDeliveryAt`, `deliveryAttempts`, and `lastDeliveryError`.
+3. `20261122130000_add_user_token_version` adds `User.tokenVersion` (`INTEGER NOT NULL DEFAULT 0`). A successful password change or reset increments it atomically, and `requireAuth` rejects tokens whose `ver` claim no longer matches. Tokens issued before `ver` existed are treated as generation `0` until a password change or reset.
 
-Rollback order: deploy the previous application version first, keep the backup, then roll back `20261122121000...` with SQL equivalent to:
+Rollback order: deploy the previous application version first, keep the backup, then roll back `20261122130000...` by dropping `User.tokenVersion` and marking that migration resolved as rolled back. Then roll back `20261122121000...` with SQL equivalent to:
 
 ```sql
 DELETE FROM "NotificationOutbox"
@@ -158,9 +159,9 @@ The earlier device migrations are already in the repo and follow the same backup
 All routes below are under `/api/me` except the auth routes, require a bearer token where indicated, return `X-Request-Id`, and set `Cache-Control: no-store`.
 
 - `POST /api/auth/forgot-password` with `{ "email": "..." }` always returns `200` with the same message, so callers cannot enumerate accounts. For an active account it stores only a SHA-256 hash of a random token, expires it after `PASSWORD_RESET_TTL_MINUTES`, and upserts one `PASSWORD_RESET` job keyed by user. A second request invalidates the earlier token and replaces the queued email.
-- `POST /api/auth/reset-password` with `{ "token": "...", "password": "..." }` consumes the token in a conditional update, bcrypt-hashes the new password, clears all password-reset jobs for the user, and returns `200`. Invalid or expired tokens return `400`.
+- `POST /api/auth/reset-password` with `{ "token": "...", "password": "..." }` consumes the token in a conditional update, bcrypt-hashes the new password, clears all password-reset jobs for the user, increments the user's token version, and returns `200`. Invalid or expired tokens return `400`.
 - `PATCH /api/auth/me` updates `firstName`, `lastName`, and/or `email` and returns the same safe user projection as registration/login. An email already used by another account returns `409`; changing the email also clears any outstanding reset token.
-- `POST /api/auth/change-password` verifies `currentPassword`, rejects an unchanged `newPassword`, replaces the bcrypt hash, and clears reset jobs. It does not revoke already-issued bearer tokens; JWTs have no per-token version and expire after seven days.
+- `POST /api/auth/change-password` verifies `currentPassword`, rejects an unchanged `newPassword`, replaces the bcrypt hash, clears reset jobs, and increments the user's token version. All bearer tokens issued before the change are rejected by `requireAuth`; sign in again with the new password to obtain a fresh token.
 - `GET /api/me/data-export` returns `{ exportedAt, user, events, registrations, checkIns, auditLogs }` with safe fields only. It includes owned events and registrations tied to those events or to the account's email; tokens, password hashes, and QR hashes are excluded.
 - `DELETE /api/me` sets `accountStatus: DELETED`, anonymizes the profile and password hash, clears reset state, and soft-deletes owned events. It is a soft/anonymizing deletion: event, registration, attendee, and audit history is retained for integrity, and guest RSVP rows are not rewritten. JWTs cannot be revoked individually, but `requireAuth` checks account status on every request, so existing tokens receive `403` after deletion.
 - `GET /api/me/preferences` and `PUT /api/me/preferences` read/update `{ emailNotifications, locale }`. `locale` accepts short tags such as `en` or `en-GB`.
@@ -221,7 +222,7 @@ All transitions re-check the status under the event advisory lock and use a cond
 - `GET /health` is a static liveness probe. `GET /health/ready` checks database connectivity and returns `503` when the database is unreachable.
 - Every response carries `X-Request-Id`; clients may supply a validated `X-Request-Id` header for correlation. Request logs include the ID and redact token-like query parameters and ticket path segments.
 - Sensitive organizer actions are recorded in `AuditLog` with actor, event, action, timestamp, and safe metadata only: event create/update/publish/unpublish/cancel/complete/delete, RSVP decisions and cancellations, ticket issue/reissue/revoke/check-in, and upload signing. Raw QR and confirmation tokens are never written to audit records. `GET /api/events/:eventId/audit?page=1&pageSize=20` is a read-only, owner-scoped view (`pageSize` max 100) that returns `entries` and `pagination` with `details` exactly as stored; audit rows cannot be edited through the API.
-- `npm test` and `npm run test:safe` run the safe suite; CI runs typechecking, whitespace checks, and the safe suite. `npm run test:direct` bypasses the database guard and should only be used deliberately.
+- `npm test` and `npm run test:safe` run the safe suite; CI runs typechecking, build, and whitespace checks, and adds the safe suite when `TEST_DATABASE_URL` and `TEST_DIRECT_URL` secrets are present. `npm run test:direct` bypasses the database guard and should only be used deliberately.
 
 ## Deployment smoke tests
 

@@ -26,8 +26,9 @@ let deadlineEventSlug: string;
 let otherEventId: string;
 let otherEventSlug: string;
 
-function accessToken(userId: string) {
-  return jwt.sign({ sub: userId }, env.jwtSecret, { expiresIn: '5m', algorithm: 'HS256' });
+function accessToken(userId: string, tokenVersion?: number) {
+  const claims = tokenVersion === undefined ? { sub: userId } : { sub: userId, ver: tokenVersion };
+  return jwt.sign(claims, env.jwtSecret, { expiresIn: '5m', algorithm: 'HS256' });
 }
 
 async function request(path: string, init?: RequestInit) {
@@ -3429,6 +3430,8 @@ test('password recovery and account self-service stay additive and non-enumerati
     assert.equal(response.headers.get('cache-control'), 'no-store');
     assert.equal((await prisma.user.findUniqueOrThrow({ where: { id: user.id } })).passwordResetTokenHash, null);
 
+    response = await request('/api/auth/me', { headers: authHeaders });
+    assert.equal(response.status, 401);
     response = await request('/api/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -3441,10 +3444,15 @@ test('password recovery and account self-service stay additive and non-enumerati
       body: JSON.stringify({ email: updatedEmail, password: 'ResetPassword123!' }),
     });
     assert.equal(response.status, 200);
+    const resetLogin = await response.json() as { token: string };
+    const freshAuthHeaders = {
+      Authorization: `Bearer ${resetLogin.token}`,
+      'Content-Type': 'application/json',
+    };
 
-    response = await request('/api/me', { method: 'DELETE', headers: authHeaders });
+    response = await request('/api/me', { method: 'DELETE', headers: freshAuthHeaders });
     assert.equal(response.status, 200);
-    response = await request('/api/auth/me', { headers: authHeaders });
+    response = await request('/api/auth/me', { headers: freshAuthHeaders });
     assert.equal(response.status, 403);
     // Deletion also replaces the stored password hash, so login fails before the
     // account-status check; existing bearer tokens are rejected with 403 above.
@@ -3471,6 +3479,164 @@ test('password recovery and account self-service stay additive and non-enumerati
       await prisma.rSVPRegistration.deleteMany({ where: { eventId: { in: eventIds } } });
       await prisma.auditLog.deleteMany({ where: { eventId: { in: eventIds } } });
       await prisma.event.deleteMany({ where: { id: { in: eventIds } } });
+    }
+    if (userIds.length) {
+      await prisma.user.deleteMany({ where: { id: { in: userIds } } });
+    }
+  }
+});
+
+test('password change and reset invalidate previously issued JWTs', async () => {
+  const localSuffix = randomUUID();
+  const originalResetUrl = env.passwordResetUrl;
+  const userIds: string[] = [];
+  let localServer: ReturnType<typeof app.listen> | undefined;
+  const bearerHeaders = (token: string) => ({
+    Authorization: `Bearer ${token}`,
+    'Content-Type': 'application/json',
+  });
+
+  try {
+    env.passwordResetUrl = 'https://gather-test.example/reset-password';
+    localServer = app.listen(0);
+    server = localServer;
+
+    const [user, otherUser] = await Promise.all([
+      prisma.user.create({
+        data: {
+          firstName: 'Session',
+          lastName: 'Owner',
+          email: `session-invalidation-${localSuffix}@example.test`,
+          passwordHash: await bcrypt.hash('OriginalPassword123!', 12),
+        },
+      }),
+      prisma.user.create({
+        data: {
+          firstName: 'Other',
+          lastName: 'User',
+          email: `session-other-${localSuffix}@example.test`,
+          passwordHash: 'test-only-hash',
+        },
+      }),
+    ]);
+    userIds.push(user.id, otherUser.id);
+
+    const preChangeToken = accessToken(user.id, 0);
+    const otherUserToken = accessToken(otherUser.id, 0);
+    const expiredToken = jwt.sign({ sub: user.id, ver: 0 }, env.jwtSecret, { expiresIn: -1, algorithm: 'HS256' });
+
+    let response = await request('/api/auth/me', { headers: bearerHeaders(preChangeToken) });
+    assert.equal(response.status, 200);
+    response = await request('/api/auth/me', { headers: bearerHeaders(otherUserToken) });
+    assert.equal(response.status, 200);
+    response = await request('/api/auth/me');
+    assert.equal(response.status, 401);
+    response = await request('/api/auth/me', { headers: bearerHeaders('not-a-jwt') });
+    assert.equal(response.status, 401);
+    response = await request('/api/auth/me', { headers: bearerHeaders(expiredToken) });
+    assert.equal(response.status, 401);
+    assert.equal((await prisma.user.findUniqueOrThrow({ where: { id: user.id } })).tokenVersion, 0);
+
+    response = await request('/api/auth/change-password', {
+      method: 'POST',
+      headers: bearerHeaders(preChangeToken),
+      body: JSON.stringify({ currentPassword: 'WrongPassword123!', newPassword: 'ChangedPassword123!' }),
+    });
+    assert.equal(response.status, 401);
+    response = await request('/api/auth/me', { headers: bearerHeaders(preChangeToken) });
+    assert.equal(response.status, 200);
+
+    response = await request('/api/auth/change-password', {
+      method: 'POST',
+      headers: bearerHeaders(preChangeToken),
+      body: JSON.stringify({ currentPassword: 'OriginalPassword123!', newPassword: 'ChangedPassword123!' }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await prisma.user.findUniqueOrThrow({ where: { id: user.id } })).tokenVersion, 1);
+
+    response = await request('/api/auth/me', { headers: bearerHeaders(preChangeToken) });
+    assert.equal(response.status, 401);
+    response = await request('/api/auth/me', { headers: bearerHeaders(otherUserToken) });
+    assert.equal(response.status, 200);
+    response = await request('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: user.email, password: 'OriginalPassword123!' }),
+    });
+    assert.equal(response.status, 401);
+    response = await request('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: user.email, password: 'ChangedPassword123!' }),
+    });
+    assert.equal(response.status, 200);
+    const afterChangeLogin = await response.json() as { token: string };
+    const afterChangeClaims = jwt.verify(afterChangeLogin.token, env.jwtSecret) as unknown as { sub?: string; ver?: number };
+    assert.equal(afterChangeClaims.sub, user.id);
+    assert.equal(afterChangeClaims.ver, 1);
+    response = await request('/api/auth/me', { headers: bearerHeaders(afterChangeLogin.token) });
+    assert.equal(response.status, 200);
+
+    response = await request('/api/auth/forgot-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: user.email }),
+    });
+    assert.equal(response.status, 200);
+    const resetJob = await prisma.notificationOutbox.findUniqueOrThrow({
+      where: { dedupeKey_type: { dedupeKey: `password-reset:${user.id}`, type: NotificationType.PASSWORD_RESET } },
+    });
+    const resetPayload = resetJob.payload as unknown as { resetUrl: string };
+    const resetToken = new URL(resetPayload.resetUrl).searchParams.get('token');
+    assert.ok(resetToken && resetToken.length >= 32);
+
+    response = await request('/api/auth/reset-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: `${resetToken}invalid`, password: 'ResetPassword123!' }),
+    });
+    assert.equal(response.status, 400);
+    assert.equal((await prisma.user.findUniqueOrThrow({ where: { id: user.id } })).tokenVersion, 1);
+
+    response = await request('/api/auth/reset-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: resetToken, password: 'ResetPassword123!' }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await prisma.user.findUniqueOrThrow({ where: { id: user.id } })).tokenVersion, 2);
+
+    response = await request('/api/auth/me', { headers: bearerHeaders(afterChangeLogin.token) });
+    assert.equal(response.status, 401);
+    response = await request('/api/auth/me', { headers: bearerHeaders(preChangeToken) });
+    assert.equal(response.status, 401);
+    response = await request('/api/auth/me', { headers: bearerHeaders(otherUserToken) });
+    assert.equal(response.status, 200);
+    response = await request('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: user.email, password: 'ChangedPassword123!' }),
+    });
+    assert.equal(response.status, 401);
+    response = await request('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: user.email, password: 'ResetPassword123!' }),
+    });
+    assert.equal(response.status, 200);
+    const afterResetLogin = await response.json() as { token: string };
+    const afterResetClaims = jwt.verify(afterResetLogin.token, env.jwtSecret) as unknown as { sub?: string; ver?: number };
+    assert.equal(afterResetClaims.sub, user.id);
+    assert.equal(afterResetClaims.ver, 2);
+    response = await request('/api/auth/me', { headers: bearerHeaders(afterResetLogin.token) });
+    assert.equal(response.status, 200);
+    response = await request('/api/auth/me');
+    assert.equal(response.status, 401);
+  } finally {
+    env.passwordResetUrl = originalResetUrl;
+    if (server === localServer) {
+      await new Promise<void>((resolve, reject) => localServer!.close((error) => error ? reject(error) : resolve()));
+      server = undefined;
     }
     if (userIds.length) {
       await prisma.user.deleteMany({ where: { id: { in: userIds } } });

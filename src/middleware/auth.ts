@@ -43,6 +43,15 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     return res.status(401).json({ message: 'Invalid or expired token.' });
   }
 
+  // Tokens issued before tokenVersion existed have no `ver` claim. Treat them as
+  // generation 0 so a deployment does not log everyone out; a password change or
+  // reset increments the stored version and rejects those tokens immediately.
+  const tokenVersionClaim = payload.ver;
+  if (tokenVersionClaim !== undefined && (!Number.isInteger(tokenVersionClaim) || tokenVersionClaim < 0)) {
+    return res.status(401).json({ message: 'Invalid or expired token.' });
+  }
+  const tokenVersion = tokenVersionClaim ?? 0;
+
   try {
     const user = await prisma.user.findUnique({
       where: { id: payload.sub },
@@ -55,10 +64,11 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
         profileImageUrl: true,
         createdAt: true,
         updatedAt: true,
+        tokenVersion: true,
       },
     });
 
-    if (!user) {
+    if (!user || user.tokenVersion !== tokenVersion) {
       return res.status(401).json({ message: 'Invalid or expired token.' });
     }
 

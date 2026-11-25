@@ -98,19 +98,20 @@ export async function registerUser(input: unknown) {
   const passwordHash = await bcrypt.hash(payload.password, 12);
 
   try {
-    const user = await prisma.user.create({
+    const created = await prisma.user.create({
       data: {
         firstName: payload.firstName,
         lastName: payload.lastName,
         email: payload.email,
         passwordHash,
       },
-      select: safeUserSelect,
+      select: { ...safeUserSelect, tokenVersion: true },
     });
+    const { tokenVersion, ...user } = created;
 
     return {
       user,
-      token: createAccessToken(user),
+      token: createAccessToken(user, tokenVersion),
     };
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
@@ -125,7 +126,7 @@ export async function loginUser(input: unknown) {
   const payload = loginSchema.parse(input);
   const user = await prisma.user.findFirst({
     where: { email: { equals: payload.email, mode: 'insensitive' } },
-    select: { ...safeUserSelect, passwordHash: true },
+    select: { ...safeUserSelect, passwordHash: true, tokenVersion: true },
   });
 
   if (!user || !(await bcrypt.compare(payload.password, user.passwordHash))) {
@@ -136,11 +137,11 @@ export async function loginUser(input: unknown) {
     throw new HttpError(403, 'This account is not active.');
   }
 
-  const { passwordHash: _passwordHash, ...safeUser } = user;
+  const { passwordHash: _passwordHash, tokenVersion, ...safeUser } = user;
 
   return {
     user: safeUser,
-    token: createAccessToken(safeUser),
+    token: createAccessToken(safeUser, tokenVersion),
   };
 }
 
@@ -208,7 +209,12 @@ export async function resetPassword(input: unknown) {
         passwordResetTokenHash,
         passwordResetExpiresAt: { gt: new Date() },
       },
-      data: { passwordHash, passwordResetTokenHash: null, passwordResetExpiresAt: null },
+      data: {
+        passwordHash,
+        passwordResetTokenHash: null,
+        passwordResetExpiresAt: null,
+        tokenVersion: { increment: 1 },
+      },
     });
     if (updated.count !== 1) throw new HttpError(400, 'Invalid or expired password reset token.');
     await closePasswordResetJobs(tx, user.id);
@@ -269,13 +275,18 @@ export async function changeCurrentUserPassword(userId: string, input: unknown) 
   await prisma.$transaction(async (tx) => {
     await tx.user.update({
       where: { id: user.id },
-      data: { passwordHash, passwordResetTokenHash: null, passwordResetExpiresAt: null },
+      data: {
+        passwordHash,
+        passwordResetTokenHash: null,
+        passwordResetExpiresAt: null,
+        tokenVersion: { increment: 1 },
+      },
     });
     await closePasswordResetJobs(tx, user.id);
   });
   return { message: 'Your password has been changed.' };
 }
 
-function createAccessToken(user: Pick<SafeUser, 'id' | 'email'>) {
-  return jwt.sign({ sub: user.id }, env.jwtSecret, { expiresIn: '7d', algorithm: 'HS256' });
+function createAccessToken(user: Pick<SafeUser, 'id' | 'email'>, tokenVersion: number) {
+  return jwt.sign({ sub: user.id, ver: tokenVersion }, env.jwtSecret, { expiresIn: '7d', algorithm: 'HS256' });
 }

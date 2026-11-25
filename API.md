@@ -10,9 +10,9 @@ Base URL: `/api`. All bodies are JSON. Errors use `{ "message": string }`; valid
 | `POST /auth/login` | Public | Rate limited. Returns safe user fields and a bearer token. |
 | `GET /auth/me` | Bearer | Returns the current safe user projection. |
 | `POST /auth/forgot-password` | Public | `{ email }`; rate limited; always `200` with the same generic message whether or not the account exists. Queues one `PASSWORD_RESET` outbox job. |
-| `POST /auth/reset-password` | Public | `{ token, password }`; rate limited; `200` on success, `400` for an invalid/expired token. Clears all reset jobs for that user. |
+| `POST /auth/reset-password` | Public | `{ token, password }`; rate limited; `200` on success, `400` for an invalid/expired token. Clears all reset jobs and invalidates bearer tokens issued before the reset; sign in again with the new password. |
 | `PATCH /auth/me` | Bearer | `{ firstName?, lastName?, email? }` (at least one); `200` with `{ user }`; `409` if the email belongs to another account. |
-| `POST /auth/change-password` | Bearer | `{ currentPassword, newPassword }`; `401` for a wrong current password, `400` if unchanged. |
+| `POST /auth/change-password` | Bearer | `{ currentPassword, newPassword }`; `401` for a wrong current password, `400` if unchanged. Success invalidates bearer tokens issued before the change; sign in again with the new password. |
 
 Organizer routes require `Authorization: Bearer <token>` and are scoped to events owned by that user. Guest self-service uses a long-lived confirmation credential in the request body; it is not an account login and remains usable until the registration is cancelled.
 
