@@ -16,7 +16,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
 
       - name: Install dependencies
@@ -36,16 +36,26 @@ jobs:
             git diff --check HEAD^ HEAD
           fi
 
-      - name: Write safe test environment
+      - name: Detect safe test database configuration
+        id: test_db
         env:
           TEST_DATABASE_URL: ${{ secrets.TEST_DATABASE_URL }}
           TEST_DIRECT_URL: ${{ secrets.TEST_DIRECT_URL }}
         run: |
-          if [ -z "$TEST_DATABASE_URL" ] || [ -z "$TEST_DIRECT_URL" ]; then
-            echo "TEST_DATABASE_URL and TEST_DIRECT_URL secrets are required" >&2
-            exit 1
+          if [ -n "$TEST_DATABASE_URL" ] && [ -n "$TEST_DIRECT_URL" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::TEST_DATABASE_URL and TEST_DIRECT_URL secrets are not configured; integration tests will be skipped. Add both secrets pointing to the disposable gather_rsvp_test database to enable them."
           fi
-          printf 'DATABASE_URL=%s\nDIRECT_URL=%s\n' "$TEST_DATABASE_URL" "$TEST_DIRECT_URL" > .env.test.local
+
+      - name: Write safe test environment
+        if: steps.test_db.outputs.available == 'true'
+        env:
+          TEST_DATABASE_URL: ${{ secrets.TEST_DATABASE_URL }}
+          TEST_DIRECT_URL: ${{ secrets.TEST_DIRECT_URL }}
+        run: printf 'DATABASE_URL=%s\nDIRECT_URL=%s\n' "$TEST_DATABASE_URL" "$TEST_DIRECT_URL" > .env.test.local
 
       - name: Integration tests (safe test database)
+        if: steps.test_db.outputs.available == 'true'
         run: npm test
